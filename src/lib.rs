@@ -8,9 +8,15 @@ struct AskTerm {
 #[derive(PartialEq, Eq, Clone, Debug)]
 enum Constraint {
     None,
-    String(String),
-    Number(Rational64),
+    EqualTo(Atom),
+}
+
+#[derive(PartialEq, Eq, Clone, Debug)]
+enum Atom {
+    /** 真なるアトム (Stringは名前としての存在であってコードからは参照すべきではない) */
     Atom(String),
+    /** 数値としてのアトム */
+    Number(Rational64),
 }
 
 struct Constraints {
@@ -53,8 +59,12 @@ struct ExecuteEnvironment<'a> {
 }
 
 struct Behavior {
-    variable_list: Vec<String>,
-    solve: fn(environment: &mut ExecuteEnvironment) -> Result<(), ()>,
+    argument_list: Vec<String>,
+    root: Box<dyn Agent>,
+}
+
+trait Agent {
+    fn solve(&self, environment: &mut ExecuteEnvironment) -> Result<(), ()>;
 }
 
 fn call(
@@ -63,7 +73,7 @@ fn call(
     argument_variables: Vec<String>,
 ) -> Result<(), ()> {
     let mut new_key_store = HashMap::new();
-    for (index, variable_id) in question.variable_list.iter().enumerate() {
+    for (index, variable_id) in question.argument_list.iter().enumerate() {
         new_key_store.insert(
             variable_id.to_string(),
             env.key_store
@@ -79,11 +89,11 @@ fn call(
         },
     };
 
-    let solve_result = (question.solve)(&mut environment);
+    let solve_result = question.root.solve(&mut environment);
     if let Err(_) = solve_result {
         return Err(());
     } else {
-        for (index, variable_id) in question.variable_list.iter().enumerate() {
+        for (index, variable_id) in question.argument_list.iter().enumerate() {
             let tell_result = env.key_store.tell(
                 argument_variables.get(index).unwrap().into(),
                 &environment
@@ -99,16 +109,63 @@ fn call(
     }
 }
 
+struct TellAgent {
+    variable_id: String,
+    atom: Atom,
+}
+
+impl Agent for TellAgent {
+    fn solve(&self, environment: &mut ExecuteEnvironment) -> Result<(), ()> {
+        if let ConstraintCheckResult::CONTRADICTION = environment.key_store.tell(
+            self.variable_id.clone(),
+            &Constraint::EqualTo(self.atom.clone()),
+        ) {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn create_tell_agent(variable_id: String, atom: Atom) -> Box<dyn Agent> {
+    Box::new(TellAgent { variable_id, atom })
+}
+
+struct CallAgent {
+    behavior_name: String,
+    argument_variable_list: Vec<String>,
+}
+
+impl Agent for CallAgent {
+    fn solve(&self, environment: &mut ExecuteEnvironment) -> Result<(), ()> {
+        let a = environment.behaviors.get(&self.behavior_name).unwrap();
+        let call_result = call(environment, a, self.argument_variable_list.clone());
+        if let Ok(_) = call_result {
+            return Ok(());
+        } else {
+            return Err(());
+        }
+    }
+}
+
+fn create_call_agent(behavior_name: String, argument_variable_list: Vec<String>) -> Box<dyn Agent> {
+    Box::new(CallAgent {
+        behavior_name,
+        argument_variable_list,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        call, Behavior, Constraint, ConstraintCheckResult, Constraints, ExecuteEnvironment,
+        call, create_call_agent, create_tell_agent, Atom, Behavior, Constraint,
+        ConstraintCheckResult, Constraints, ExecuteEnvironment,
     };
 
     #[test]
-    fn it_works() {
+    fn simple_constraint_system() {
         /*
         Behavior
         - A(O) {O="AAAAA"}
@@ -121,35 +178,18 @@ mod tests {
         behaviors.insert(
             "A".into(),
             Behavior {
-                variable_list: vec!["O".into()],
-                solve: |env| {
-                    if let ConstraintCheckResult::CONTRADICTION = env
-                        .key_store
-                        .tell("O".into(), &Constraint::String("AAAAA".into()))
-                    {
-                        Err(())
-                    } else {
-                        Ok(())
-                    }
-                },
+                argument_list: vec!["O".into()],
+                root: create_tell_agent("O".into(), Atom::Atom("AAAAA".into()).into()),
             },
         );
 
         let question: Behavior = Behavior {
-            solve: |env| {
-                let a = env.behaviors.get("A").unwrap();
-                let call_result = call(env, a, vec!["X".into()]);
-                if let Ok(_) = call_result {
-                    return Ok(());
-                } else {
-                    return Err(());
-                }
-            },
-            variable_list: vec!["X".into()],
+            argument_list: vec!["X".into()],
+            root: create_call_agent("A".into(), vec!["X".into()]),
         };
 
         let mut env = ExecuteEnvironment {
-            behaviors: &mut behaviors,
+            behaviors: &behaviors,
             key_store: Constraints {
                 constraints: HashMap::from([("X".into(), Constraint::None)]),
             },
@@ -161,11 +201,12 @@ mod tests {
             assert!(false);
         }
 
-        match env.key_store.get_constraint("X".into()).unwrap() {
-            Constraint::String(s) => assert_eq!(s, "AAAAA"),
-            _ => {
-                assert!(false);
-            }
+        if let Constraint::EqualTo(Atom::Atom(s)) =
+            env.key_store.get_constraint("X".into()).unwrap()
+        {
+            assert_eq!(s, "AAAAA");
+        } else {
+            assert!(false);
         };
     }
 }
