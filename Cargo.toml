@@ -7,3 +7,4 @@ edition = "2018"
 
 [dependencies]
 num-rational = "0.4"
+futures = "0.3.0"
