@@ -1,3 +1,5 @@
+mod parser;
+
 use num_rational::Rational64;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
