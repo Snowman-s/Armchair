@@ -72,7 +72,7 @@ pub struct ExecuteEnvironment<'a> {
     key_store: Constraints,
 }
 
-struct Behavior {
+pub struct Behavior {
     argument_list: Vec<String>,
     root: Box<dyn Agent>,
 }
@@ -237,6 +237,7 @@ mod tests {
     use crate::{
         call, create_ask_agent, create_call_agent, create_linear_agent, create_tell_agent,
         expressions::expressions::{Expression, Expressions},
+        parser::parser::{compile_all, parse_behavior},
         AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
         ExecuteEnvironment,
     };
@@ -516,5 +517,47 @@ mod tests {
         } else {
             assert!(false);
         };
+    }
+
+    #[test]
+    fn simple_compile_test() {
+        match compile_all("Agent(A) :: A=atom.") {
+            Err(message) => {
+                assert!(false);
+            }
+            Ok(name_and_behavior) => {
+                let behaviors: HashMap<String, Behavior> = HashMap::from([name_and_behavior]);
+
+                let question: Behavior = Behavior {
+                    argument_list: vec!["X".into()],
+                    root: create_linear_agent(vec![create_call_agent(
+                        "Agent".into(),
+                        vec!["X".into()],
+                    )]),
+                };
+
+                let env = ExecuteEnvironment {
+                    behaviors: &behaviors,
+                    key_store: Constraints {
+                        constraints: Arc::new(Mutex::new(HashMap::from([(
+                            "X".into(),
+                            Constraint::None,
+                        )]))),
+                        condvar: Condvar::new(),
+                    },
+                };
+
+                let call_result = call(&env, &question, vec!["X".into()]);
+
+                if let Err(_) = call_result {
+                    assert!(false);
+                }
+
+                assert_eq!(
+                    env.key_store.get_constraint("X".into()),
+                    Constraint::EqualTo(Atom::Atom("atom".into()))
+                );
+            }
+        }
     }
 }

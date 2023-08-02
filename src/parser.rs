@@ -22,6 +22,19 @@ pub mod parser {
         TellAgent(LexerTellAgent),
     }
 
+    impl LexerAgent {
+        fn compile(&self) -> Box<dyn Agent> {
+            match self {
+                LexerAgent::TellAgent(lexer) => Box::new(TellAgent {
+                    variable_id: lexer.variable.clone(),
+                    expression: Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom(lexer.expression.clone()))],
+                    },
+                }),
+            }
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerTellAgent {
         variable: String,
@@ -31,14 +44,28 @@ pub mod parser {
     use nom::{
         character::complete::multispace0,
         character::streaming::{alpha1, char},
-        combinator::map,
+        combinator::{map, opt},
+        multi::many0,
         sequence::tuple,
+        streaming::tag,
         IResult,
     };
 
-    use crate::{create_tell_agent, Agent};
+    use crate::{
+        expressions::expressions::{Expression, Expressions},
+        Agent, Atom, Behavior, TellAgent,
+    };
 
     type Res<'a, T> = IResult<&'a str, T>;
+
+    pub fn compile_all(code: &str) -> Result<(String, Behavior), String> {
+        let lexer = parse_behavior(code);
+        if let Ok((_, ok_lexer)) = lexer {
+            compile_behavior(&ok_lexer)
+        } else {
+            Err(lexer.unwrap_err().to_string())
+        }
+    }
 
     pub fn parse_behavior(code: &str) -> Res<LexerBehavior> {
         map(
@@ -65,9 +92,30 @@ pub mod parser {
     }
 
     fn parse_behavior_arguments(code: &str) -> Res<LexerBehaviorArguments> {
-        map(tuple((char('('), multispace0, char(')'))), |(_, _, _)| {
-            LexerBehaviorArguments { terms: vec![] }
-        })(code)
+        map(
+            tuple((
+                char('('),
+                multispace0,
+                opt(tuple((
+                    alpha1,
+                    multispace0,
+                    many0(tuple((char(','), multispace0, alpha1))),
+                ))),
+                multispace0,
+                char(')'),
+            )),
+            |(_, _, args, _, _)| LexerBehaviorArguments {
+                terms: args
+                    .map::<Vec<String>, fn((&str, _, Vec<_>)) -> Vec<String>>(|(first, _, rest)| {
+                        let mut ret = vec![first.into()];
+                        for (_, _, variable) in rest {
+                            ret.push(variable.into());
+                        }
+                        ret
+                    })
+                    .unwrap_or(vec![]),
+            },
+        )(code)
     }
 
     fn parse_agents(code: &str) -> Res<LexerAgent> {
@@ -86,6 +134,16 @@ pub mod parser {
                 expression: exp.into(),
             },
         )(code)
+    }
+
+    fn compile_behavior(lexer: &LexerBehavior) -> Result<(String, Behavior), String> {
+        Ok((
+            lexer.name.clone(),
+            Behavior {
+                argument_list: lexer.arguments.terms.clone(),
+                root: lexer.root.compile(),
+            },
+        ))
     }
 
     #[cfg(test)]
