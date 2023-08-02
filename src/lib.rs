@@ -1,5 +1,7 @@
+mod expressions;
 mod parser;
 
+use expressions::expressions::Expressions;
 use num_rational::Rational64;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,7 +18,7 @@ enum Constraint {
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
-enum Atom {
+pub enum Atom {
     /** 真なるアトム (Stringは名前としての存在であってコードからは参照すべきではない) */
     Atom(String),
     /** 数値としてのアトム */
@@ -65,7 +67,7 @@ enum ConstraintCheckResult {
     CONTRADICTION,
 }
 
-struct ExecuteEnvironment<'a> {
+pub struct ExecuteEnvironment<'a> {
     behaviors: &'a HashMap<String, Behavior>,
     key_store: Constraints,
 }
@@ -122,15 +124,17 @@ fn call(
 
 struct TellAgent {
     variable_id: String,
-    atom: Atom,
+    expression: Expressions,
 }
 
 impl Agent for TellAgent {
     fn solve(&self, environment: &ExecuteEnvironment<'_>) -> Result<(), ()> {
-        if let ConstraintCheckResult::CONTRADICTION = environment.key_store.tell(
-            self.variable_id.clone(),
-            &Constraint::EqualTo(self.atom.clone()),
-        ) {
+        let expr_solved = self.expression.solve(&environment);
+
+        if let ConstraintCheckResult::CONTRADICTION = environment
+            .key_store
+            .tell(self.variable_id.clone(), &Constraint::EqualTo(expr_solved))
+        {
             Err(())
         } else {
             Ok(())
@@ -138,8 +142,11 @@ impl Agent for TellAgent {
     }
 }
 
-fn create_tell_agent(variable_id: String, atom: Atom) -> Box<dyn Agent> {
-    Box::new(TellAgent { variable_id, atom })
+fn create_tell_agent(variable_id: String, expr: Expressions) -> Box<dyn Agent> {
+    Box::new(TellAgent {
+        variable_id,
+        expression: expr,
+    })
 }
 
 struct CallAgent {
@@ -228,8 +235,10 @@ mod tests {
     };
 
     use crate::{
-        call, create_ask_agent, create_call_agent, create_linear_agent, create_tell_agent, AskTerm,
-        Atom, Behavior, Constraint, ConstraintCheckResult, Constraints, ExecuteEnvironment,
+        call, create_ask_agent, create_call_agent, create_linear_agent, create_tell_agent,
+        expressions::expressions::{Expression, Expressions},
+        AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
+        ExecuteEnvironment,
     };
 
     #[test]
@@ -239,7 +248,7 @@ mod tests {
         - A(!O) {O="AAAAA"}
         Question
         - ask A(!X)?
-        - Q(!Ans) {A(!X), Ans=X} とみなされる。少し実際のコードでは省略している。
+        - Q(!X) {A(!X)} とみなされる。
         */
         let mut behaviors: HashMap<String, Behavior> = HashMap::new();
 
@@ -247,7 +256,12 @@ mod tests {
             "A".into(),
             Behavior {
                 argument_list: vec!["O".into()],
-                root: create_tell_agent("O".into(), Atom::Atom("AAAAA".into()).into()),
+                root: create_tell_agent(
+                    "O".into(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
+                    },
+                ),
             },
         );
 
@@ -285,7 +299,7 @@ mod tests {
         - B(!O) {O="BBBBB"}
         Question
         - ask A(!X), B(!Y)?
-        - Q(!Ans, !Ans2) {A(!X), Ans=X, B(!Y), Ans2=Y} とみなされる。少し実際のコードでは省略している。
+        - Q(!X, !Y) {A(!X), B(!Y)} とみなされる。
         */
 
         let mut behaviors: HashMap<String, Behavior> = HashMap::new();
@@ -294,14 +308,24 @@ mod tests {
             "A".into(),
             Behavior {
                 argument_list: vec!["O".into()],
-                root: create_tell_agent("O".into(), Atom::Atom("AAAAA".into()).into()),
+                root: create_tell_agent(
+                    "O".into(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
+                    },
+                ),
             },
         );
         behaviors.insert(
             "B".into(),
             Behavior {
                 argument_list: vec!["O".into()],
-                root: create_tell_agent("O".into(), Atom::Atom("BBBBB".into()).into()),
+                root: create_tell_agent(
+                    "O".into(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("BBBBB".into()))],
+                    },
+                ),
             },
         );
 
@@ -350,14 +374,19 @@ mod tests {
         - B(!O) {I="AAAAA" -> O="BBBBB", A(!I)}
         Question
         - ask B(!X)?
-        - Q(!Ans) {B(!X), Ans=X} とみなされる。少し実際のコードでは省略している。
+        - Q(!X) {B(!X)} とみなされる。
         */
         let behaviors: HashMap<String, Behavior> = HashMap::from([
             (
                 "A".into(),
                 Behavior {
                     argument_list: vec!["O".into()],
-                    root: create_tell_agent("O".into(), Atom::Atom("AAAAA".into()).into()),
+                    root: create_tell_agent(
+                        "O".into(),
+                        Expressions {
+                            exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
+                        },
+                    ),
                 },
             ),
             (
@@ -391,7 +420,12 @@ mod tests {
                                     }
                                 },
                             },
-                            create_tell_agent("O".into(), Atom::Atom("BBBBB".into()).into()),
+                            create_tell_agent(
+                                "O".into(),
+                                Expressions {
+                                    exprs: vec![Expression::Atom(Atom::Atom("BBBBB".into()))],
+                                },
+                            ),
                         ),
                         create_call_agent("A".into(), vec!["I".into()]),
                     ]),
@@ -420,6 +454,65 @@ mod tests {
 
         if let Constraint::EqualTo(Atom::Atom(s)) = env.key_store.get_constraint("X".into()) {
             assert_eq!(s, "BBBBB");
+        } else {
+            assert!(false);
+        };
+    }
+
+    #[test]
+    fn propagation() {
+        /*
+        Behavior
+        - A(!O) {O=X, X=3}
+        Question
+        - ask A(!X)?
+        - Q(!X) {A(!X)} とみなされる。
+        */
+
+        let mut behaviors: HashMap<String, Behavior> = HashMap::new();
+
+        behaviors.insert(
+            "A".into(),
+            Behavior {
+                argument_list: vec!["O".into()],
+                root: create_linear_agent(vec![
+                    create_tell_agent(
+                        "O".into(),
+                        Expressions {
+                            exprs: vec![Expression::Variable("X".into())],
+                        },
+                    ),
+                    create_tell_agent(
+                        "X".into(),
+                        Expressions {
+                            exprs: vec![Expression::Atom(Atom::Number(3.into()))],
+                        },
+                    ),
+                ]),
+            },
+        );
+
+        let question: Behavior = Behavior {
+            argument_list: vec!["X".into()],
+            root: create_linear_agent(vec![create_call_agent("A".into(), vec!["X".into()])]),
+        };
+
+        let env = ExecuteEnvironment {
+            behaviors: &behaviors,
+            key_store: Constraints {
+                constraints: Arc::new(Mutex::new(HashMap::from([("X".into(), Constraint::None)]))),
+                condvar: Condvar::new(),
+            },
+        };
+
+        let call_result = call(&env, &question, vec!["X".into()]);
+
+        if let Err(_) = call_result {
+            assert!(false);
+        }
+
+        if let Constraint::EqualTo(Atom::Number(s)) = env.key_store.get_constraint("X".into()) {
+            assert_eq!(s, 3.into());
         } else {
             assert!(false);
         };
