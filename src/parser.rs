@@ -41,6 +41,11 @@ pub mod parser {
         expression: String,
     }
 
+    pub enum CompileError {
+        Error(String),
+        Incomplete,
+    }
+
     use nom::{
         character::complete::multispace0,
         character::streaming::{alpha1, char},
@@ -58,12 +63,14 @@ pub mod parser {
 
     type Res<'a, T> = IResult<&'a str, T>;
 
-    pub fn compile_all(code: &str) -> Result<(String, Behavior), String> {
+    pub fn compile_one_behavior(code: &str) -> Result<((String, Behavior), String), CompileError> {
         let lexer = parse_behavior(code);
-        if let Ok((_, ok_lexer)) = lexer {
-            compile_behavior(&ok_lexer)
-        } else {
-            Err(lexer.unwrap_err().to_string())
+        match lexer {
+            Ok((code, ok_lexer)) => compile_behavior(&ok_lexer)
+                .map(|behavior| (behavior, code.into()))
+                .map_err(|s| CompileError::Error(s)),
+            Err(nom::Err::Incomplete(_)) => Err(CompileError::Incomplete),
+            Err(err) => Err(CompileError::Error(err.to_string())),
         }
     }
 

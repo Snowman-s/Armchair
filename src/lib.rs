@@ -1,5 +1,5 @@
-mod expressions;
-mod parser;
+pub mod expressions;
+pub mod parser;
 
 use expressions::expressions::Expressions;
 use num_rational::Rational64;
@@ -237,7 +237,7 @@ mod tests {
     use crate::{
         call, create_ask_agent, create_call_agent, create_linear_agent, create_tell_agent,
         expressions::expressions::{Expression, Expressions},
-        parser::parser::{compile_all, parse_behavior},
+        parser::parser::{compile_one_behavior, parse_behavior},
         AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
         ExecuteEnvironment,
     };
@@ -521,11 +521,11 @@ mod tests {
 
     #[test]
     fn simple_compile_test() {
-        match compile_all("Agent(A) :: A=atom.") {
+        match compile_one_behavior("Agent(A) :: A=atom.") {
             Err(message) => {
                 assert!(false);
             }
-            Ok(name_and_behavior) => {
+            Ok((name_and_behavior, _)) => {
                 let behaviors: HashMap<String, Behavior> = HashMap::from([name_and_behavior]);
 
                 let question: Behavior = Behavior {
