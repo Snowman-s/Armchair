@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-struct AskTerm {
-    prove: fn(constraints: &ExecuteEnvironment) -> ConstraintCheckResult,
+trait AskTerm: Send + Sync {
+    fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult;
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -207,13 +207,13 @@ fn create_linear_agent(children: Vec<Box<dyn Agent>>) -> Box<dyn Agent> {
 }
 
 struct AskAgent {
-    ask_term: AskTerm,
+    ask_term: Box<dyn AskTerm>,
     then: Box<dyn Agent>,
 }
 
 impl Agent for AskAgent {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()> {
-        let check_res = &(self.ask_term.prove)(&environment);
+        let check_res = &self.ask_term.prove(&environment);
 
         if let ConstraintCheckResult::CONTRADICTION = check_res {
             Err(())
@@ -223,8 +223,27 @@ impl Agent for AskAgent {
     }
 }
 
-fn create_ask_agent(ask_term: AskTerm, then: Box<dyn Agent>) -> Box<dyn Agent> {
+fn create_ask_agent(ask_term: Box<dyn AskTerm>, then: Box<dyn Agent>) -> Box<dyn Agent> {
     Box::new(AskAgent { ask_term, then })
+}
+
+struct AskTermAEqualB {
+    left: Expressions,
+    right: Expressions,
+}
+
+impl AskTerm for AskTermAEqualB {
+    fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult {
+        if self.left.solve(constraints) == self.right.solve(constraints) {
+            ConstraintCheckResult::SUCCEED(HashMap::new())
+        } else {
+            ConstraintCheckResult::CONTRADICTION
+        }
+    }
+}
+
+fn create_ask_term_a_equal_b(left: Expressions, right: Expressions) -> Box<dyn AskTerm> {
+    Box::new(AskTermAEqualB { left, right })
 }
 
 #[cfg(test)]
@@ -235,7 +254,8 @@ mod tests {
     };
 
     use crate::{
-        call, create_ask_agent, create_call_agent, create_linear_agent, create_tell_agent,
+        call, create_ask_agent, create_ask_term_a_equal_b, create_call_agent, create_linear_agent,
+        create_tell_agent,
         expressions::expressions::{Expression, Expressions},
         parser::parser::{compile_one_behavior, parse_behavior},
         AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
@@ -396,31 +416,14 @@ mod tests {
                     argument_list: vec!["O".into()],
                     root: create_linear_agent(vec![
                         create_ask_agent(
-                            AskTerm {
-                                prove: |constraints| {
-                                    let mut constraints_inner =
-                                        constraints.key_store.constraints.lock().unwrap();
-                                    loop {
-                                        if let Some(Constraint::EqualTo(atom)) =
-                                            constraints_inner.get("I".into())
-                                        {
-                                            if *atom == Atom::Atom("AAAAA".into()) {
-                                                return ConstraintCheckResult::SUCCEED(
-                                                    HashMap::new(),
-                                                );
-                                            } else {
-                                                return ConstraintCheckResult::CONTRADICTION;
-                                            }
-                                        }
-
-                                        constraints_inner = constraints
-                                            .key_store
-                                            .condvar
-                                            .wait(constraints_inner)
-                                            .unwrap();
-                                    }
+                            create_ask_term_a_equal_b(
+                                Expressions {
+                                    exprs: vec![Expression::Variable("I".into())],
                                 },
-                            },
+                                Expressions {
+                                    exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
+                                },
+                            ),
                             create_tell_agent(
                                 "O".into(),
                                 Expressions {
@@ -523,6 +526,47 @@ mod tests {
     fn simple_compile_test() {
         match compile_one_behavior("Agent(A) :: A=atom.") {
             Err(message) => {
+                assert!(false);
+            }
+            Ok((name_and_behavior, _)) => {
+                let behaviors: HashMap<String, Behavior> = HashMap::from([name_and_behavior]);
+
+                let question: Behavior = Behavior {
+                    argument_list: vec!["X".into()],
+                    root: create_linear_agent(vec![create_call_agent(
+                        "Agent".into(),
+                        vec!["X".into()],
+                    )]),
+                };
+
+                let env = ExecuteEnvironment {
+                    behaviors: &behaviors,
+                    key_store: Constraints {
+                        constraints: Arc::new(Mutex::new(HashMap::from([(
+                            "X".into(),
+                            Constraint::None,
+                        )]))),
+                        condvar: Condvar::new(),
+                    },
+                };
+
+                let call_result = call(&env, &question, vec!["X".into()]);
+
+                if let Err(_) = call_result {
+                    assert!(false);
+                }
+
+                assert_eq!(
+                    env.key_store.get_constraint("X".into()),
+                    Constraint::EqualTo(Atom::Atom("atom".into()))
+                );
+            }
+        }
+    }
+    #[test]
+    fn complex_compile_test() {
+        match compile_one_behavior("Agent(X) ::A=atom->X=atom, A=atom.") {
+            Err(_message) => {
                 assert!(false);
             }
             Ok((name_and_behavior, _)) => {

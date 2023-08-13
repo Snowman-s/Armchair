@@ -20,6 +20,9 @@ pub mod parser {
     #[derive(Debug, PartialEq, Eq)]
     pub enum LexerAgent {
         TellAgent(LexerTellAgent),
+        CallAgent(LexerCallAgent),
+        AskAgent(Box<LexerAskAgent>),
+        LinearAgent(Box<LexerLinearAgent>),
     }
 
     impl LexerAgent {
@@ -31,6 +34,17 @@ pub mod parser {
                         exprs: vec![Expression::Atom(Atom::Atom(lexer.expression.clone()))],
                     },
                 }),
+                LexerAgent::CallAgent(lexer) => Box::new(CallAgent {
+                    behavior_name: lexer.behavior_name.clone(),
+                    argument_variable_list: lexer.argument_variable_list.clone(),
+                }),
+                LexerAgent::AskAgent(lexer) => Box::new(AskAgent {
+                    ask_term: lexer.ask_term.compile(),
+                    then: lexer.then.compile(),
+                }),
+                LexerAgent::LinearAgent(lexer) => Box::new(LinearAgent {
+                    children: lexer.children.iter().map(|c| c.compile()).collect(),
+                }),
             }
         }
     }
@@ -41,24 +55,62 @@ pub mod parser {
         expression: String,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct LexerCallAgent {
+        behavior_name: String,
+        argument_variable_list: Vec<String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct LexerAskAgent {
+        ask_term: LexerAskTerm,
+        then: LexerAgent,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerAskTerm {
+        AEqualB(String, String),
+    }
+
+    impl LexerAskTerm {
+        fn compile(&self) -> Box<dyn AskTerm> {
+            Box::new(match self {
+                Self::AEqualB(left, right) => AskTermAEqualB {
+                    left: Expressions {
+                        exprs: vec![Expression::Variable(left.clone())],
+                    },
+                    right: Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom(right.clone()))],
+                    },
+                },
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct LexerLinearAgent {
+        children: Vec<LexerAgent>,
+    }
+
     pub enum CompileError {
         Error(String),
         Incomplete,
     }
 
     use nom::{
+        branch::alt,
         character::complete::multispace0,
         character::streaming::{alpha1, char},
         combinator::{map, opt},
-        multi::many0,
+        multi::{many0, separated_list0, separated_list1},
         sequence::tuple,
-        streaming::tag,
         IResult,
     };
 
     use crate::{
         expressions::expressions::{Expression, Expressions},
-        Agent, Atom, Behavior, TellAgent,
+        Agent, AskAgent, AskTerm, AskTermAEqualB, Atom, Behavior, CallAgent, LinearAgent,
+        TellAgent,
     };
 
     type Res<'a, T> = IResult<&'a str, T>;
@@ -126,19 +178,112 @@ pub mod parser {
     }
 
     fn parse_agents(code: &str) -> Res<LexerAgent> {
-        let tell = parse_tell_agent(code);
-        match tell {
-            Ok((str, agent)) => Ok((str, LexerAgent::TellAgent(agent))),
-            Err(res) => Err(res),
-        }
+        alt((
+            //優先
+            parse_linear_agent,
+            parse_ask_agent,
+            //非優先
+            parse_tell_agent,
+            parse_call_agent,
+        ))(code)
     }
 
-    fn parse_tell_agent(code: &str) -> Res<LexerTellAgent> {
+    fn parse_bracket_agents(code: &str) -> Res<LexerAgent> {
+        map(
+            tuple((char('('), multispace0, parse_agents, multispace0, char(')'))),
+            |(_, _, it, _, _)| it,
+        )(code)
+    }
+
+    fn parse_agents_without_linear(code: &str) -> Res<LexerAgent> {
+        alt((
+            //優先
+            parse_ask_agent,
+            //非優先
+            parse_tell_agent,
+            parse_call_agent,
+        ))(code)
+    }
+
+    fn parse_agents_without_linear_or_bracket(code: &str) -> Res<LexerAgent> {
+        alt((parse_bracket_agents, parse_agents_without_linear))(code)
+    }
+
+    fn parse_tell_agent(code: &str) -> Res<LexerAgent> {
         map(
             tuple((alpha1, multispace0, char('='), multispace0, alpha1)),
-            |(var, _, _, _, exp): (&str, _, _, _, &str)| LexerTellAgent {
-                variable: var.into(),
-                expression: exp.into(),
+            |(var, _, _, _, exp): (&str, _, _, _, &str)| {
+                LexerAgent::TellAgent(LexerTellAgent {
+                    variable: var.into(),
+                    expression: exp.into(),
+                })
+            },
+        )(code)
+    }
+
+    fn parse_call_agent(code: &str) -> Res<LexerAgent> {
+        map(
+            tuple((
+                alpha1,
+                multispace0,
+                char('('),
+                separated_list0(tuple((multispace0, char(','), multispace0)), alpha1),
+                multispace0,
+                char(')'),
+            )),
+            |(behavior_name, _, _, exp, _, _): (&str, _, _, Vec<&str>, _, _)| {
+                LexerAgent::CallAgent(LexerCallAgent {
+                    behavior_name: behavior_name.into(),
+                    argument_variable_list: exp.into_iter().map(|s| s.into()).collect(),
+                })
+            },
+        )(code)
+    }
+
+    fn parse_ask_agent(code: &str) -> Res<LexerAgent> {
+        map(
+            tuple((
+                parse_ask_term,
+                multispace0,
+                char('-'),
+                char('>'),
+                multispace0,
+                parse_agents_without_linear_or_bracket,
+            )),
+            |(ask_term, _, _, _, _, child)| {
+                LexerAgent::AskAgent(Box::new(LexerAskAgent {
+                    ask_term,
+                    then: child,
+                }))
+            },
+        )(code)
+    }
+
+    fn parse_ask_term(code: &str) -> Res<LexerAskTerm> {
+        map(
+            tuple((alpha1, multispace0, char('='), multispace0, alpha1)),
+            |(leftside, _, _, _, rightside): (&str, _, _, _, &str)| {
+                LexerAskTerm::AEqualB(leftside.into(), rightside.into())
+            },
+        )(code)
+    }
+
+    fn parse_linear_agent(code: &str) -> Res<LexerAgent> {
+        map(
+            tuple((
+                parse_agents_without_linear_or_bracket,
+                multispace0,
+                char(','),
+                multispace0,
+                separated_list1(
+                    tuple((multispace0, char(','), multispace0)),
+                    parse_agents_without_linear_or_bracket,
+                ),
+            )),
+            |(a1, _, _, _, mut a2s)| {
+                let mut children = vec![a1];
+                children.append(&mut a2s);
+                LexerAgent::LinearAgent(Box::new(LexerLinearAgent { children }))
             },
         )(code)
     }

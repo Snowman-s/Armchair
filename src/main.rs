@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{self, Read, Write},
+    io::{self, Write},
 };
 
 use armchair::{
