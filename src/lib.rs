@@ -565,7 +565,7 @@ mod tests {
     }
     #[test]
     fn complex_compile_test() {
-        match compile_one_behavior("Agent(X) ::A=atom->X=atom, A=atom.") {
+        match compile_one_behavior("Agent(X) ::_variable=atom->X='Atom', _variable=A, A=atom.") {
             Err(_message) => {
                 assert!(false);
             }
@@ -599,7 +599,7 @@ mod tests {
 
                 assert_eq!(
                     env.key_store.get_constraint("X".into()),
-                    Constraint::EqualTo(Atom::Atom("atom".into()))
+                    Constraint::EqualTo(Atom::Atom("Atom".into()))
                 );
             }
         }

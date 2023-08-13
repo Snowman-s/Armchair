@@ -1,9 +1,4 @@
 pub mod parser {
-    #[derive(Debug)]
-    pub struct LexerBehaviors {
-        behaviors: Vec<LexerBehavior>,
-    }
-
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerBehavior {
         name: String,
@@ -30,9 +25,7 @@ pub mod parser {
             match self {
                 LexerAgent::TellAgent(lexer) => Box::new(TellAgent {
                     variable_id: lexer.variable.clone(),
-                    expression: Expressions {
-                        exprs: vec![Expression::Atom(Atom::Atom(lexer.expression.clone()))],
-                    },
+                    expression: lexer.expression.compile(),
                 }),
                 LexerAgent::CallAgent(lexer) => Box::new(CallAgent {
                     behavior_name: lexer.behavior_name.clone(),
@@ -52,7 +45,7 @@ pub mod parser {
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerTellAgent {
         variable: String,
-        expression: String,
+        expression: LexerExpressions,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -69,19 +62,15 @@ pub mod parser {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum LexerAskTerm {
-        AEqualB(String, String),
+        AEqualB(LexerExpressions, LexerExpressions),
     }
 
     impl LexerAskTerm {
         fn compile(&self) -> Box<dyn AskTerm> {
             Box::new(match self {
                 Self::AEqualB(left, right) => AskTermAEqualB {
-                    left: Expressions {
-                        exprs: vec![Expression::Variable(left.clone())],
-                    },
-                    right: Expressions {
-                        exprs: vec![Expression::Atom(Atom::Atom(right.clone()))],
-                    },
+                    left: left.compile(),
+                    right: right.compile(),
                 },
             })
         }
@@ -92,6 +81,27 @@ pub mod parser {
         children: Vec<LexerAgent>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerExpressions {
+        Variable(String),
+        AtomString(String),
+    }
+
+    impl LexerExpressions {
+        fn to_vec(&self) -> Vec<Expression> {
+            match self {
+                LexerExpressions::Variable(v) => vec![Expression::Variable(v.into())],
+                LexerExpressions::AtomString(s) => vec![Expression::Atom(Atom::Atom(s.into()))],
+            }
+        }
+        fn compile(&self) -> Expressions {
+            Expressions {
+                exprs: self.to_vec(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     pub enum CompileError {
         Error(String),
         Incomplete,
@@ -99,9 +109,13 @@ pub mod parser {
 
     use nom::{
         branch::alt,
+        bytes::{
+            complete::take_until,
+            streaming::{take_while, take_while_m_n},
+        },
         character::complete::multispace0,
         character::streaming::{alpha1, char},
-        combinator::{map, opt},
+        combinator::{map, opt, recognize},
         multi::{many0, separated_list0, separated_list1},
         sequence::tuple,
         IResult,
@@ -211,11 +225,17 @@ pub mod parser {
 
     fn parse_tell_agent(code: &str) -> Res<LexerAgent> {
         map(
-            tuple((alpha1, multispace0, char('='), multispace0, alpha1)),
-            |(var, _, _, _, exp): (&str, _, _, _, &str)| {
+            tuple((
+                parse_variable,
+                multispace0,
+                char('='),
+                multispace0,
+                parse_expressions,
+            )),
+            |(var, _, _, _, exp): (&str, _, _, _, LexerExpressions)| {
                 LexerAgent::TellAgent(LexerTellAgent {
                     variable: var.into(),
-                    expression: exp.into(),
+                    expression: exp,
                 })
             },
         )(code)
@@ -261,9 +281,15 @@ pub mod parser {
 
     fn parse_ask_term(code: &str) -> Res<LexerAskTerm> {
         map(
-            tuple((alpha1, multispace0, char('='), multispace0, alpha1)),
-            |(leftside, _, _, _, rightside): (&str, _, _, _, &str)| {
-                LexerAskTerm::AEqualB(leftside.into(), rightside.into())
+            tuple((
+                parse_expressions,
+                multispace0,
+                char('='),
+                multispace0,
+                parse_expressions,
+            )),
+            |(leftside, _, _, _, rightside): (LexerExpressions, _, _, _, LexerExpressions)| {
+                LexerAskTerm::AEqualB(leftside, rightside)
             },
         )(code)
     }
@@ -288,6 +314,44 @@ pub mod parser {
         )(code)
     }
 
+    fn parse_until_non_symbol(code: &str) -> Res<&str> {
+        recognize(take_while(|s: char| {
+            ![',', '(', ')', '\'', ' ', '　', ':', '-', '>', '.', '='].contains(&s)
+        }))(code)
+    }
+
+    fn parse_variable(code: &str) -> Res<&str> {
+        alt((
+            // '_' から始まる
+            recognize(tuple((char('_'), parse_until_non_symbol))),
+            // アルファベット大文字から始まる
+            recognize(tuple((
+                take_while_m_n(1, 1, |chr| ('A' <= chr && chr <= 'Z')),
+                parse_until_non_symbol,
+            ))),
+        ))(code)
+    }
+
+    fn parse_expressions(code: &str) -> Res<LexerExpressions> {
+        alt((
+            // 変数
+            map(parse_variable, |s| LexerExpressions::Variable(s.into())),
+            // 文字列アトム
+            map(
+                alt((
+                    // '' で囲まれている
+                    map(
+                        tuple((char('\''), take_until("'"), char('\''))),
+                        |(_, s, _)| s,
+                    ),
+                    // 任意の文字列
+                    parse_until_non_symbol,
+                )),
+                |s| LexerExpressions::AtomString(s.into()),
+            ),
+        ))(code)
+    }
+
     fn compile_behavior(lexer: &LexerBehavior) -> Result<(String, Behavior), String> {
         Ok((
             lexer.name.clone(),
@@ -303,7 +367,7 @@ pub mod parser {
         use nom::Needed;
 
         use crate::parser::parser::{
-            LexerAgent, LexerBehavior, LexerBehaviorArguments, LexerTellAgent,
+            LexerAgent, LexerBehavior, LexerBehaviorArguments, LexerExpressions, LexerTellAgent,
         };
 
         use super::parse_behavior;
@@ -320,7 +384,7 @@ pub mod parser {
                             arguments: LexerBehaviorArguments { terms: vec![] },
                             root: LexerAgent::TellAgent(LexerTellAgent {
                                 variable: "A".into(),
-                                expression: "B".into()
+                                expression: LexerExpressions::Variable("B".into())
                             })
                         }
                     )
