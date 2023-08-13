@@ -241,7 +241,7 @@ impl Agent for AskAgent {
         let check_res = &self.ask_term.prove(&environment);
 
         if let ConstraintCheckResult::CONTRADICTION = check_res {
-            Err(())
+            Ok(())
         } else {
             self.then.solve(environment)
         }
@@ -282,9 +282,8 @@ mod tests {
         call, create_ask_agent, create_ask_term_a_equal_b, create_call_agent, create_linear_agent,
         create_tell_agent,
         expressions::expressions::{Expression, Expressions},
-        parser::parser::{compile_one_behavior, parse_behavior, ParseResult},
-        AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
-        ExecuteEnvironment,
+        parser::parser::{compile_one_behavior, ParseResult},
+        Atom, Behavior, Constraint, Constraints, ExecuteEnvironment,
     };
 
     #[test]
