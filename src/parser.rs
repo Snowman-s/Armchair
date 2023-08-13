@@ -158,7 +158,7 @@ pub mod parser {
             map(
                 tuple((
                     multispace0,
-                    alpha1,
+                    parse_until_non_symbol,
                     multispace0,
                     parse_behavior_arguments,
                     multispace0,
@@ -199,9 +199,9 @@ pub mod parser {
                 char('('),
                 multispace0,
                 opt(tuple((
-                    alpha1,
+                    parse_variable,
                     multispace0,
-                    many0(tuple((char(','), multispace0, alpha1))),
+                    many0(tuple((char(','), multispace0, parse_variable))),
                 ))),
                 multispace0,
                 char(')'),
@@ -273,10 +273,10 @@ pub mod parser {
     fn parse_call_agent(code: &str) -> Res<LexerAgent> {
         map(
             tuple((
-                alpha1,
+                parse_until_non_symbol,
                 multispace0,
                 char('('),
-                separated_list0(tuple((multispace0, char(','), multispace0)), alpha1),
+                separated_list0(tuple((multispace0, char(','), multispace0)), parse_variable),
                 multispace0,
                 char(')'),
             )),
