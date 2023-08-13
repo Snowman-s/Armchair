@@ -4,6 +4,7 @@ pub mod parser;
 use expressions::expressions::Expressions;
 use num_rational::Rational64;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -12,7 +13,7 @@ trait AskTerm: Send + Sync {
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
-enum Constraint {
+pub enum Constraint {
     None,
     EqualTo(Atom),
 }
@@ -23,6 +24,15 @@ pub enum Atom {
     Atom(String),
     /** 数値としてのアトム */
     Number(Rational64),
+}
+
+impl ToString for Atom {
+    fn to_string(&self) -> String {
+        match self {
+            Atom::Atom(atom) => format!("\'{}\'", atom),
+            Atom::Number(rational) => rational.to_string(),
+        }
+    }
 }
 
 struct Constraints {
@@ -72,12 +82,27 @@ pub struct ExecuteEnvironment<'a> {
     key_store: Constraints,
 }
 
+impl ExecuteEnvironment<'_> {
+    pub fn new(
+        behaviors: &HashMap<String, Behavior>,
+        map: Arc<Mutex<HashMap<String, Constraint>>>,
+    ) -> ExecuteEnvironment {
+        ExecuteEnvironment {
+            behaviors,
+            key_store: Constraints {
+                constraints: map,
+                condvar: Condvar::new(),
+            },
+        }
+    }
+}
+
 pub struct Behavior {
     argument_list: Vec<String>,
     root: Box<dyn Agent>,
 }
 
-trait Agent: Send + Sync {
+pub trait Agent: Send + Sync {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()>;
 }
 
@@ -257,7 +282,7 @@ mod tests {
         call, create_ask_agent, create_ask_term_a_equal_b, create_call_agent, create_linear_agent,
         create_tell_agent,
         expressions::expressions::{Expression, Expressions},
-        parser::parser::{compile_one_behavior, parse_behavior},
+        parser::parser::{compile_one_behavior, parse_behavior, ParseResult},
         AskTerm, Atom, Behavior, Constraint, ConstraintCheckResult, Constraints,
         ExecuteEnvironment,
     };
@@ -525,10 +550,7 @@ mod tests {
     #[test]
     fn simple_compile_test() {
         match compile_one_behavior("Agent(A) :: A=atom.") {
-            Err(message) => {
-                assert!(false);
-            }
-            Ok((name_and_behavior, _)) => {
+            Ok((ParseResult::Behavior(name_and_behavior), _)) => {
                 let behaviors: HashMap<String, Behavior> = HashMap::from([name_and_behavior]);
 
                 let question: Behavior = Behavior {
@@ -561,15 +583,15 @@ mod tests {
                     Constraint::EqualTo(Atom::Atom("atom".into()))
                 );
             }
+            _ => {
+                assert!(false);
+            }
         }
     }
     #[test]
     fn complex_compile_test() {
         match compile_one_behavior("Agent(X) ::_variable=atom->X='Atom', _variable=A, A=atom.") {
-            Err(_message) => {
-                assert!(false);
-            }
-            Ok((name_and_behavior, _)) => {
+            Ok((ParseResult::Behavior(name_and_behavior), _)) => {
                 let behaviors: HashMap<String, Behavior> = HashMap::from([name_and_behavior]);
 
                 let question: Behavior = Behavior {
@@ -601,6 +623,9 @@ mod tests {
                     env.key_store.get_constraint("X".into()),
                     Constraint::EqualTo(Atom::Atom("Atom".into()))
                 );
+            }
+            _ => {
+                assert!(false);
             }
         }
     }

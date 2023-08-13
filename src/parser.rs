@@ -7,6 +7,12 @@ pub mod parser {
     }
 
     #[derive(Debug, PartialEq, Eq)]
+    pub enum ParseResult<B, Q> {
+        Behavior(B),
+        Question(Q),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     pub struct LexerBehaviorArguments {
         // 仮置き
         terms: Vec<String>,
@@ -129,39 +135,62 @@ pub mod parser {
 
     type Res<'a, T> = IResult<&'a str, T>;
 
-    pub fn compile_one_behavior(code: &str) -> Result<((String, Behavior), String), CompileError> {
+    pub fn compile_one_behavior(
+        code: &str,
+    ) -> Result<(ParseResult<(String, Behavior), Box<dyn Agent>>, &str), CompileError> {
         let lexer = parse_behavior(code);
         match lexer {
-            Ok((code, ok_lexer)) => compile_behavior(&ok_lexer)
-                .map(|behavior| (behavior, code.into()))
-                .map_err(|s| CompileError::Error(s)),
+            Ok((code, result)) => match result {
+                ParseResult::Behavior(lexer) => compile_behavior(&lexer)
+                    .map(|(name, behavior)| (ParseResult::Behavior((name.into(), behavior)), code))
+                    .map_err(|s| CompileError::Error(s)),
+                ParseResult::Question(question) => {
+                    Ok((ParseResult::Question(question.compile()), code))
+                }
+            },
             Err(nom::Err::Incomplete(_)) => Err(CompileError::Incomplete),
             Err(err) => Err(CompileError::Error(err.to_string())),
         }
     }
 
-    pub fn parse_behavior(code: &str) -> Res<LexerBehavior> {
-        map(
-            tuple((
-                multispace0,
-                alpha1,
-                multispace0,
-                parse_behavior_arguments,
-                multispace0,
-                char(':'),
-                char(':'),
-                multispace0,
-                parse_agents,
-                multispace0,
-                char('.'),
-                multispace0,
-            )),
-            |(_, name, _, arguments, _, _, _, _, root, _, _, _)| LexerBehavior {
-                name: name.into(),
-                arguments,
-                root,
-            },
-        )(code)
+    pub fn parse_behavior(code: &str) -> Res<ParseResult<LexerBehavior, LexerAgent>> {
+        alt((
+            map(
+                tuple((
+                    multispace0,
+                    alpha1,
+                    multispace0,
+                    parse_behavior_arguments,
+                    multispace0,
+                    char(':'),
+                    char(':'),
+                    multispace0,
+                    parse_agents,
+                    multispace0,
+                    char('.'),
+                    multispace0,
+                )),
+                |(_, name, _, arguments, _, _, _, _, root, _, _, _)| {
+                    ParseResult::Behavior(LexerBehavior {
+                        name: name.into(),
+                        arguments,
+                        root,
+                    })
+                },
+            ),
+            map(
+                tuple((
+                    multispace0,
+                    char('?'),
+                    multispace0,
+                    parse_agents,
+                    multispace0,
+                    char('.'),
+                    multispace0,
+                )),
+                |(_, _, _, it, _, _, _)| ParseResult::Question(it),
+            ),
+        ))(code)
     }
 
     fn parse_behavior_arguments(code: &str) -> Res<LexerBehaviorArguments> {
@@ -368,6 +397,7 @@ pub mod parser {
 
         use crate::parser::parser::{
             LexerAgent, LexerBehavior, LexerBehaviorArguments, LexerExpressions, LexerTellAgent,
+            ParseResult,
         };
 
         use super::parse_behavior;
@@ -379,14 +409,14 @@ pub mod parser {
                     assert!(code.is_empty());
                     assert_eq!(
                         tree,
-                        LexerBehavior {
+                        ParseResult::Behavior(LexerBehavior {
                             name: "agent".to_string(),
                             arguments: LexerBehaviorArguments { terms: vec![] },
                             root: LexerAgent::TellAgent(LexerTellAgent {
                                 variable: "A".into(),
                                 expression: LexerExpressions::Variable("B".into())
                             })
-                        }
+                        })
                     )
                 }
                 Err(_) => {
