@@ -2,7 +2,7 @@ pub mod parser {
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerBehavior {
         name: String,
-        arguments: LexerBehaviorArguments,
+        arguments: Vec<LexerBehaviorParameter>,
         root: LexerAgent,
     }
 
@@ -12,10 +12,10 @@ pub mod parser {
         Question(Q),
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct LexerBehaviorArguments {
-        // 仮置き
-        terms: Vec<String>,
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub enum LexerBehaviorParameter {
+        Asker(String),
+        Teller(String),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +35,18 @@ pub mod parser {
                 }),
                 LexerAgent::CallAgent(lexer) => Box::new(CallAgent {
                     behavior_name: lexer.behavior_name.clone(),
-                    argument_variable_list: lexer.argument_variable_list.clone(),
+                    argument_variable_list: lexer
+                        .argument_variable_list
+                        .iter()
+                        .map(|s| match s {
+                            LexerCallArgument::Asker(variable) => {
+                                CallArgument::Asker(variable.into())
+                            }
+                            LexerCallArgument::Teller(variable) => {
+                                CallArgument::Teller(variable.into())
+                            }
+                        })
+                        .collect(),
                 }),
                 LexerAgent::AskAgent(lexer) => Box::new(AskAgent {
                     ask_term: lexer.ask_term.compile(),
@@ -57,7 +68,13 @@ pub mod parser {
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerCallAgent {
         behavior_name: String,
-        argument_variable_list: Vec<String>,
+        argument_variable_list: Vec<LexerCallArgument>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerCallArgument {
+        Asker(String),
+        Teller(String),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -129,8 +146,8 @@ pub mod parser {
 
     use crate::{
         expressions::expressions::{Expression, Expressions},
-        Agent, AskAgent, AskTerm, AskTermAEqualB, Atom, Behavior, CallAgent, LinearAgent,
-        TellAgent,
+        Agent, AskAgent, AskTerm, AskTermAEqualB, Atom, Behavior, BehaviorParam, CallAgent,
+        CallArgument, LinearAgent, TellAgent,
     };
 
     type Res<'a, T> = IResult<&'a str, T>;
@@ -160,7 +177,7 @@ pub mod parser {
                     multispace0,
                     parse_until_non_symbol,
                     multispace0,
-                    parse_behavior_arguments,
+                    parse_behavior_parameters,
                     multispace0,
                     char(':'),
                     char(':'),
@@ -193,31 +210,40 @@ pub mod parser {
         ))(code)
     }
 
-    fn parse_behavior_arguments(code: &str) -> Res<LexerBehaviorArguments> {
+    fn parse_behavior_parameters(code: &str) -> Res<Vec<LexerBehaviorParameter>> {
         map(
             tuple((
                 char('('),
                 multispace0,
                 opt(tuple((
-                    parse_variable,
+                    parse_behavior_param,
                     multispace0,
-                    many0(tuple((char(','), multispace0, parse_variable))),
+                    many0(tuple((char(','), multispace0, parse_behavior_param))),
                 ))),
                 multispace0,
                 char(')'),
             )),
-            |(_, _, args, _, _)| LexerBehaviorArguments {
-                terms: args
-                    .map::<Vec<String>, fn((&str, _, Vec<_>)) -> Vec<String>>(|(first, _, rest)| {
-                        let mut ret = vec![first.into()];
-                        for (_, _, variable) in rest {
-                            ret.push(variable.into());
-                        }
-                        ret
-                    })
-                    .unwrap_or(vec![]),
+            |(_, _, args, _, _)| {
+                args.map(|(first, _, rest)| {
+                    let mut ret = vec![first];
+                    for (_, _, variable) in rest {
+                        ret.push(variable);
+                    }
+                    ret
+                })
+                .unwrap_or(vec![])
             },
         )(code)
+    }
+
+    fn parse_behavior_param(code: &str) -> Res<LexerBehaviorParameter> {
+        alt((
+            map(
+                tuple((char('!'), multispace0, parse_variable)),
+                |(_, _, v)| LexerBehaviorParameter::Teller(v.into()),
+            ),
+            map(parse_variable, |v| LexerBehaviorParameter::Asker(v.into())),
+        ))(code)
     }
 
     fn parse_agents(code: &str) -> Res<LexerAgent> {
@@ -276,17 +302,30 @@ pub mod parser {
                 parse_until_non_symbol,
                 multispace0,
                 char('('),
-                separated_list0(tuple((multispace0, char(','), multispace0)), parse_variable),
+                separated_list0(
+                    tuple((multispace0, char(','), multispace0)),
+                    parse_call_argument,
+                ),
                 multispace0,
                 char(')'),
             )),
-            |(behavior_name, _, _, exp, _, _): (&str, _, _, Vec<&str>, _, _)| {
+            |(behavior_name, _, _, exp, _, _)| {
                 LexerAgent::CallAgent(LexerCallAgent {
                     behavior_name: behavior_name.into(),
-                    argument_variable_list: exp.into_iter().map(|s| s.into()).collect(),
+                    argument_variable_list: exp,
                 })
             },
         )(code)
+    }
+
+    fn parse_call_argument(code: &str) -> Res<LexerCallArgument> {
+        alt((
+            map(
+                tuple((char('!'), multispace0, parse_variable)),
+                |(_, _, v)| LexerCallArgument::Teller(v.into()),
+            ),
+            map(parse_variable, |v| LexerCallArgument::Asker(v.into())),
+        ))(code)
     }
 
     fn parse_ask_agent(code: &str) -> Res<LexerAgent> {
@@ -385,7 +424,14 @@ pub mod parser {
         Ok((
             lexer.name.clone(),
             Behavior {
-                argument_list: lexer.arguments.terms.clone(),
+                param_list: lexer
+                    .arguments
+                    .iter()
+                    .map(|s| match s {
+                        LexerBehaviorParameter::Asker(v) => BehaviorParam::Asker(v.into()),
+                        LexerBehaviorParameter::Teller(v) => BehaviorParam::Teller(v.into()),
+                    })
+                    .collect(),
                 root: lexer.root.compile(),
             },
         ))
@@ -396,8 +442,7 @@ pub mod parser {
         use nom::Needed;
 
         use crate::parser::parser::{
-            LexerAgent, LexerBehavior, LexerBehaviorArguments, LexerExpressions, LexerTellAgent,
-            ParseResult,
+            LexerAgent, LexerBehavior, LexerExpressions, LexerTellAgent, ParseResult,
         };
 
         use super::parse_behavior;
@@ -411,7 +456,7 @@ pub mod parser {
                         tree,
                         ParseResult::Behavior(LexerBehavior {
                             name: "agent".to_string(),
-                            arguments: LexerBehaviorArguments { terms: vec![] },
+                            arguments: vec![],
                             root: LexerAgent::TellAgent(LexerTellAgent {
                                 variable: "A".into(),
                                 expression: LexerExpressions::Variable("B".into())
