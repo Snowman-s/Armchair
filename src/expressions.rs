@@ -12,7 +12,7 @@ pub mod expressions {
             let mut stack = VecDeque::new();
 
             for expr in &self.exprs {
-                expr.apply(env, &mut stack);
+                expr.apply(env, &mut stack)?;
             }
 
             stack.get(0).ok_or_else(|| ()).cloned()
