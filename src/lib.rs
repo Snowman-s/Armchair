@@ -3,12 +3,14 @@ pub mod parser;
 
 use expressions::expressions::Expressions;
 use num_rational::Rational64;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 trait AskTerm: Send + Sync {
     fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult;
+
+    fn variables(&self) -> HashSet<String>;
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -34,57 +36,200 @@ impl ToString for Atom {
     }
 }
 
-struct Constraints {
+pub struct Constraints {
     /** 変数名:制約*/
-    constraints: Arc<Mutex<HashMap<String, Constraint>>>,
-    condvar: Condvar,
+    constraints: HashMap<String, VariableInfo>,
+}
+
+type VariableInfo = (
+    // I assume variable rights cannot be changed.
+    Arc<Mutex<VariableRight>>,
+    Arc<(Mutex<Constraint>, Condvar)>,
+);
+
+/*
+  Remaining variable rights.
+*/
+enum VariableRight {
+    All,
+    Askable,
+    Tellable,
+    None,
 }
 
 impl Constraints {
-    fn tell(&self, variable_id: String, c: &Constraint) -> ConstraintCheckResult {
-        if let Some(s) = self.constraints.lock().unwrap().get(&variable_id) {
-            if s != &Constraint::None && s != c {
-                return ConstraintCheckResult::CONTRADICTION;
+    pub fn new(variables: impl Iterator<Item = String>) -> Constraints {
+        Constraints {
+            constraints: variables
+                .map(|variable_id| {
+                    (
+                        variable_id,
+                        (
+                            Arc::new(Mutex::new(VariableRight::All)),
+                            Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /**
+     * this function blocks execution until conforming "guard",
+     *
+     * Both arguments' and params' length must be same.
+     *
+     * "initilize_variable" is used for "inner" variables.
+     * If it's an element already in param, it is ignored.
+     */
+    fn copy_to_new_constraint(
+        &self,
+        arguments: &Vec<CallArgument>,
+        param: &Vec<BehaviorParam>,
+        initilize_variable_list: impl Iterator<Item = String>,
+    ) -> Result<Constraints, ()> {
+        let mut new_constraints = HashMap::new();
+
+        for (index, argument) in arguments.iter().enumerate() {
+            let new_variable = match argument {
+                CallArgument::Asker(argument_variable) => {
+                    self.get_ask_argument_rights(argument_variable)
+                }
+                CallArgument::Teller(argument_variable) => self.get_tell_rights(argument_variable),
+            }?;
+            new_constraints.insert(param[index].get_variable_name().clone(), new_variable);
+        }
+
+        for init in initilize_variable_list {
+            if !new_constraints.contains_key(&init) {
+                new_constraints.insert(
+                    init.clone(),
+                    (
+                        Arc::new(Mutex::new(VariableRight::All)),
+                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                    ),
+                );
             }
         }
 
-        self.constraints
-            .lock()
-            .unwrap()
-            .insert(variable_id.clone(), c.clone());
-        let mut ret_map: HashMap<String, Constraint> = HashMap::new();
-        ret_map.insert(variable_id, c.clone());
-
-        self.condvar.notify_all();
-
-        ConstraintCheckResult::SUCCEED(ret_map)
+        Ok(Constraints {
+            constraints: new_constraints,
+        })
     }
 
-    fn get_constraint(&self, variable_id: String) -> Constraint {
-        self.constraints
-            .lock()
-            .unwrap()
-            .get(&variable_id)
-            .unwrap_or(&Constraint::None)
-            .clone()
+    fn tell(&self, variable_id: String, told: Constraint) -> Result<(), ()> {
+        let (_, original_cons_arc) = self.get_tell_rights(&variable_id)?;
+
+        let (original_cons, condvar) = &*original_cons_arc;
+        *original_cons.lock().unwrap() = told;
+
+        condvar.notify_all();
+
+        Ok(())
     }
 
-    /** Wait until the variable's constraint is not None */
-    fn wait_until_grounded(&self, variable_id: String) -> Constraint {
-        let mut constraints_inner = self.constraints.lock().unwrap();
+    /**
+     * Err, if variable doesn't have ask-rights.
+     */
+    pub fn get_constraint(&self, variable_id: &String) -> Result<Constraint, ()> {
+        let (_, cons_arc) = self.get_ask_rights(variable_id)?;
+
+        let (cons, _) = &*cons_arc;
+
+        let ret = cons.lock().unwrap().clone();
+
+        Ok(ret)
+    }
+
+    /** Wait until the variable's constraint is not None.
+     Err, if variable doesn't have ask-rights.
+    */
+    fn wait_until_grounded(&self, variable_id: &String) -> Result<Constraint, ()> {
+        let (_, arc) = self.get_ask_rights(variable_id)?;
+
+        let (arc_constraints, condvar) = &*arc;
+
+        let mut the_constraint = arc_constraints.lock().unwrap();
         loop {
-            if let Some(Constraint::EqualTo(atom)) = constraints_inner.get(&variable_id) {
-                return Constraint::EqualTo(atom.clone());
+            if let Constraint::EqualTo(_) = *the_constraint {
+                return Ok(the_constraint.clone());
             }
 
-            constraints_inner = self.condvar.wait(constraints_inner).unwrap();
+            the_constraint = condvar.wait(the_constraint).unwrap();
+        }
+    }
+
+    /**  private function
+      - \<UnInitilized> | AskRight -> Set Tell-Right to self. Return (Ask-Right, data)
+      - Others -> Return Err.
+    */
+    fn get_ask_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
+        match self.constraints.get(variable_id) {
+            Some((right, data)) => {
+                let right_guard = right.lock().unwrap();
+                match *right_guard {
+                    VariableRight::All | VariableRight::Askable => {
+                        return Ok((Arc::new(Mutex::new(VariableRight::Askable)), data.clone()));
+                    }
+                    _ => {
+                        return Err(());
+                    }
+                };
+            }
+            None => Err(()),
+        }
+    }
+
+    /**  private function
+      - \<UnInitilized> | AskRight -> Return (Ask-Right, data)
+      - TellRight -> Set None-Right to self. Return (Tell-Right, data).
+      - NoneRight -> Err(())
+    */
+    fn get_ask_argument_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
+        match self.constraints.get(variable_id) {
+            Some((right, data)) => {
+                let mut right_guard = right.lock().unwrap();
+                match *right_guard {
+                    VariableRight::All | VariableRight::Askable => {
+                        return Ok((Arc::new(Mutex::new(VariableRight::Askable)), data.clone()));
+                    }
+                    VariableRight::Tellable => {
+                        *right_guard = VariableRight::None;
+                        return Ok((Arc::new(Mutex::new(VariableRight::Tellable)), data.clone()));
+                    }
+                    VariableRight::None => return Err(()),
+                };
+            }
+            None => Err(()),
+        }
+    }
+
+    /**  private function
+      - \<UnInitilized> -> Set Ask-Right to self. Return (Tell-Right, data)
+      - TellRight -> Return (Tell-Right, data).
+      - Others -> Return Err.
+    */
+    fn get_tell_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
+        match self.constraints.get(variable_id) {
+            Some((right, data)) => {
+                let mut right_guard = right.lock().unwrap();
+                match *right_guard {
+                    VariableRight::All => *right_guard = VariableRight::Askable,
+                    VariableRight::Tellable => *right_guard = VariableRight::None,
+                    _ => {
+                        return Err(());
+                    }
+                };
+                return Ok((Arc::new(Mutex::new(VariableRight::Tellable)), data.clone()));
+            }
+            None => Err(()),
         }
     }
 }
 
 enum ConstraintCheckResult {
     /**  constraints の一部を返す*/
-    SUCCEED(HashMap<String, Constraint>),
+    SUCCEED,
     CONTRADICTION,
 }
 
@@ -96,15 +241,16 @@ pub struct ExecuteEnvironment<'a> {
 impl ExecuteEnvironment<'_> {
     pub fn new(
         behaviors: &HashMap<String, Behavior>,
-        map: Arc<Mutex<HashMap<String, Constraint>>>,
+        top_variables: impl Iterator<Item = String>,
     ) -> ExecuteEnvironment {
         ExecuteEnvironment {
             behaviors,
-            key_store: Constraints {
-                constraints: map,
-                condvar: Condvar::new(),
-            },
+            key_store: Constraints::new(top_variables),
         }
+    }
+
+    pub fn key_store(&self) -> &Constraints {
+        &self.key_store
     }
 }
 
@@ -118,8 +264,18 @@ pub enum BehaviorParam {
     Teller(String),
 }
 
+impl BehaviorParam {
+    fn get_variable_name(&self) -> &String {
+        match self {
+            BehaviorParam::Asker(s) => s,
+            BehaviorParam::Teller(s) => s,
+        }
+    }
+}
+
 pub trait Agent: Send + Sync {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()>;
+    fn variable_list(&self) -> HashSet<String>;
 }
 
 fn call(
@@ -127,63 +283,18 @@ fn call(
     question: &Behavior,
     argument_variables: &Vec<CallArgument>,
 ) -> Result<(), ()> {
-    let mut new_key_store = HashMap::new();
-    for (index, param) in question.param_list.iter().enumerate() {
-        // If both of argument and param is Asker, argument must be grounded.
-        if let BehaviorParam::Asker(param_id) = param {
-            if let CallArgument::Asker(argument_id) = &argument_variables[index] {
-                new_key_store.insert(
-                    param_id.to_string(),
-                    env.key_store.wait_until_grounded(argument_id.clone()),
-                );
-                continue;
-            }
-        }
-        // If both of argument and param is Teller, argument don't have to be grounded.
-        if let BehaviorParam::Teller(param_id) = param {
-            if let CallArgument::Teller(argument_id) = &argument_variables[index] {
-                new_key_store.insert(
-                    param_id.to_string(),
-                    env.key_store.get_constraint(argument_id.clone()),
-                );
-                continue;
-            }
-        }
-
-        // If neither of those, we cannot proceed process.
-        return Err(());
-    }
-
-    let new_key_store_arc = Arc::new(Mutex::new(new_key_store));
-
     let new_environment = ExecuteEnvironment {
         behaviors: env.behaviors,
-        key_store: Constraints {
-            constraints: new_key_store_arc,
-            condvar: Condvar::new(),
-        },
+        key_store: env.key_store.copy_to_new_constraint(
+            argument_variables,
+            &question.param_list,
+            question.root.variable_list().into_iter(),
+        )?,
     };
 
-    let solve_result = question.root.solve(&new_environment);
-    if let Err(_) = solve_result {
-        return Err(());
-    } else {
-        // Copy "lower" environments.
-        for (index, param) in question.param_list.iter().enumerate() {
-            if let BehaviorParam::Teller(param_id) = param {
-                if let CallArgument::Teller(argument_id) = argument_variables.get(index).unwrap() {
-                    let tell_result = env.key_store.tell(
-                        argument_id.into(),
-                        &(new_environment.key_store.get_constraint(param_id.into())),
-                    );
-                    if let ConstraintCheckResult::CONTRADICTION = tell_result {
-                        return Err(());
-                    }
-                }
-            }
-        }
-        return Ok(());
-    }
+    question.root.solve(&new_environment)?;
+
+    Ok(())
 }
 
 struct TellAgent {
@@ -193,16 +304,17 @@ struct TellAgent {
 
 impl Agent for TellAgent {
     fn solve(&self, environment: &ExecuteEnvironment<'_>) -> Result<(), ()> {
-        let expr_solved = self.expression.solve(&environment);
+        let expr_solved = self.expression.solve(&environment)?;
 
-        if let ConstraintCheckResult::CONTRADICTION = environment
+        environment
             .key_store
-            .tell(self.variable_id.clone(), &Constraint::EqualTo(expr_solved))
-        {
-            Err(())
-        } else {
-            Ok(())
-        }
+            .tell(self.variable_id.clone(), Constraint::EqualTo(expr_solved))
+    }
+
+    fn variable_list(&self) -> HashSet<String> {
+        let mut expr: HashSet<String> = self.expression.variables();
+        expr.insert(self.variable_id.clone());
+        expr
     }
 }
 
@@ -223,6 +335,15 @@ enum CallArgument {
     Teller(String),
 }
 
+impl CallArgument {
+    fn get_variable_name(&self) -> &String {
+        match self {
+            CallArgument::Asker(s) => s,
+            CallArgument::Teller(s) => s,
+        }
+    }
+}
+
 impl Agent for CallAgent {
     fn solve(&self, environment: &ExecuteEnvironment<'_>) -> Result<(), ()> {
         let a = environment.behaviors.get(&self.behavior_name).unwrap();
@@ -232,6 +353,13 @@ impl Agent for CallAgent {
         } else {
             return Err(());
         }
+    }
+
+    fn variable_list(&self) -> HashSet<String> {
+        self.argument_variable_list
+            .iter()
+            .map(|arg| arg.get_variable_name().clone())
+            .collect()
     }
 }
 
@@ -272,6 +400,13 @@ impl Agent for LinearAgent {
 
         return result;
     }
+
+    fn variable_list(&self) -> HashSet<String> {
+        self.children
+            .iter()
+            .flat_map(|child| child.variable_list())
+            .collect()
+    }
 }
 
 fn create_linear_agent(children: Vec<Box<dyn Agent>>) -> Box<dyn Agent> {
@@ -293,6 +428,14 @@ impl Agent for AskAgent {
             self.then.solve(environment)
         }
     }
+
+    fn variable_list(&self) -> HashSet<String> {
+        let mut ret = self.ask_term.variables();
+
+        ret.extend(self.then.variable_list());
+
+        ret
+    }
 }
 
 fn create_ask_agent(ask_term: Box<dyn AskTerm>, then: Box<dyn Agent>) -> Box<dyn Agent> {
@@ -307,10 +450,17 @@ struct AskTermAEqualB {
 impl AskTerm for AskTermAEqualB {
     fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult {
         if self.left.solve(constraints) == self.right.solve(constraints) {
-            ConstraintCheckResult::SUCCEED(HashMap::new())
+            ConstraintCheckResult::SUCCEED
         } else {
             ConstraintCheckResult::CONTRADICTION
         }
+    }
+
+    fn variables(&self) -> HashSet<String> {
+        let mut ret = self.left.variables();
+        ret.extend(self.right.variables());
+
+        ret
     }
 }
 
@@ -320,17 +470,14 @@ fn create_ask_term_a_equal_b(left: Expressions, right: Expressions) -> Box<dyn A
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Condvar, Mutex},
-    };
+    use std::collections::HashMap;
 
     use crate::{
         call, create_ask_agent, create_ask_term_a_equal_b, create_call_agent, create_linear_agent,
         create_tell_agent,
         expressions::expressions::{Expression, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
-        Atom, Behavior, BehaviorParam, CallArgument, Constraint, Constraints, ExecuteEnvironment,
+        Atom, Behavior, BehaviorParam, CallArgument, Constraint, ExecuteEnvironment,
     };
 
     #[test]
@@ -339,8 +486,7 @@ mod tests {
         Behavior
         - A(!O) {O="AAAAA"}
         Question
-        - ask A(!X)?
-        - Q(!X) {A(!X)} とみなされる。
+        - ?A(!X)
         */
         let mut behaviors: HashMap<String, Behavior> = HashMap::new();
 
@@ -357,26 +503,17 @@ mod tests {
             },
         );
 
-        let question: Behavior = Behavior {
-            param_list: vec![BehaviorParam::Teller("X".into())],
-            root: create_call_agent("A".into(), vec![CallArgument::Teller("X".into())]),
-        };
+        let question = create_call_agent("A".into(), vec![CallArgument::Teller("X".into())]);
 
-        let env = ExecuteEnvironment {
-            behaviors: &behaviors,
-            key_store: Constraints {
-                constraints: Arc::new(Mutex::new(HashMap::from([("X".into(), Constraint::None)]))),
-                condvar: Condvar::new(),
-            },
-        };
+        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
 
-        let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
-
-        if let Err(_) = call_result {
+        if let Err(_) = question.solve(&env) {
             assert!(false);
         }
 
-        if let Constraint::EqualTo(Atom::Atom(s)) = env.key_store.get_constraint("X".into()) {
+        if let Result::Ok(Constraint::EqualTo(Atom::Atom(s))) =
+            env.key_store.get_constraint(&"X".into())
+        {
             assert_eq!(s, "AAAAA");
         } else {
             assert!(false);
@@ -390,8 +527,7 @@ mod tests {
         - A(!O) {O="AAAAA"}
         - B(!O) {O="BBBBB"}
         Question
-        - ask A(!X), B(!Y)?
-        - Q(!X, !Y) {A(!X), B(!Y)} とみなされる。
+        - ?A(!X), B(!Y)
         */
 
         let mut behaviors: HashMap<String, Behavior> = HashMap::new();
@@ -421,48 +557,26 @@ mod tests {
             },
         );
 
-        let question: Behavior = Behavior {
-            param_list: vec![
-                BehaviorParam::Teller("X".into()),
-                BehaviorParam::Teller("Y".into()),
-            ],
-            root: create_linear_agent(vec![
-                create_call_agent("A".into(), vec![CallArgument::Teller("X".into())]),
-                create_call_agent("B".into(), vec![CallArgument::Teller("Y".into())]),
-            ]),
-        };
+        let question = create_linear_agent(vec![
+            create_call_agent("A".into(), vec![CallArgument::Teller("X".into())]),
+            create_call_agent("B".into(), vec![CallArgument::Teller("Y".into())]),
+        ]);
 
-        let env = ExecuteEnvironment {
-            behaviors: &behaviors,
-            key_store: Constraints {
-                constraints: Arc::new(Mutex::new(HashMap::from([
-                    ("X".into(), Constraint::None),
-                    ("Y".into(), Constraint::None),
-                ]))),
-                condvar: Condvar::new(),
-            },
-        };
+        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
 
-        let call_result = call(
-            &env,
-            &question,
-            &vec![
-                CallArgument::Teller("X".into()),
-                CallArgument::Teller("Y".into()),
-            ],
-        );
+        let call_result = question.solve(&env);
 
         if let Err(_) = call_result {
             assert!(false);
         }
 
-        if let Constraint::EqualTo(Atom::Atom(s)) = env.key_store.get_constraint("X".into()) {
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"X".into()) {
             assert_eq!(s, "AAAAA");
         } else {
             assert!(false);
         };
 
-        if let Constraint::EqualTo(Atom::Atom(s)) = env.key_store.get_constraint("Y".into()) {
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"Y".into()) {
             assert_eq!(s, "BBBBB");
         } else {
             assert!(false);
@@ -475,8 +589,7 @@ mod tests {
         - A(!O) {O="AAAAA"}
         - B(!O) {I="AAAAA" -> O="BBBBB", A(!I)}
         Question
-        - ask B(!X)?
-        - Q(!X) {B(!X)} とみなされる。
+        - ?B(!X)
         */
         let behaviors: HashMap<String, Behavior> = HashMap::from([
             (
@@ -518,26 +631,17 @@ mod tests {
             ),
         ]);
 
-        let question: Behavior = Behavior {
-            param_list: vec![BehaviorParam::Teller("X".into())],
-            root: create_call_agent("B".into(), vec![CallArgument::Teller("X".into())]),
-        };
+        let question = create_call_agent("B".into(), vec![CallArgument::Teller("X".into())]);
 
-        let env = ExecuteEnvironment {
-            behaviors: &behaviors,
-            key_store: Constraints {
-                constraints: Arc::new(Mutex::new(HashMap::from([("X".into(), Constraint::None)]))),
-                condvar: Condvar::new(),
-            },
-        };
+        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
 
-        let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
+        let call_result = question.solve(&env);
 
         if let Err(_) = call_result {
             assert!(false);
         }
 
-        if let Constraint::EqualTo(Atom::Atom(s)) = env.key_store.get_constraint("X".into()) {
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"X".into()) {
             assert_eq!(s, "BBBBB");
         } else {
             assert!(false);
@@ -550,8 +654,7 @@ mod tests {
         Behavior
         - A(!O) {O=X, X=3}
         Question
-        - ask A(!X)?
-        - Q(!X) {A(!X)} とみなされる。
+        - ?A(!X)
         */
 
         let mut behaviors: HashMap<String, Behavior> = HashMap::new();
@@ -577,29 +680,21 @@ mod tests {
             },
         );
 
-        let question: Behavior = Behavior {
-            param_list: vec![BehaviorParam::Teller("X".into())],
-            root: create_linear_agent(vec![create_call_agent(
-                "A".into(),
-                vec![CallArgument::Teller("X".into())],
-            )]),
-        };
+        let question = create_linear_agent(vec![create_call_agent(
+            "A".into(),
+            vec![CallArgument::Teller("X".into())],
+        )]);
 
-        let env = ExecuteEnvironment {
-            behaviors: &behaviors,
-            key_store: Constraints {
-                constraints: Arc::new(Mutex::new(HashMap::from([("X".into(), Constraint::None)]))),
-                condvar: Condvar::new(),
-            },
-        };
+        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
 
-        let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
+        let call_result = question.solve(&env);
 
         if let Err(_) = call_result {
             assert!(false);
         }
 
-        if let Constraint::EqualTo(Atom::Number(s)) = env.key_store.get_constraint("X".into()) {
+        if let Ok(Constraint::EqualTo(Atom::Number(s))) = env.key_store.get_constraint(&"X".into())
+        {
             assert_eq!(s, 3.into());
         } else {
             assert!(false);
@@ -620,16 +715,8 @@ mod tests {
                     )]),
                 };
 
-                let env = ExecuteEnvironment {
-                    behaviors: &behaviors,
-                    key_store: Constraints {
-                        constraints: Arc::new(Mutex::new(HashMap::from([(
-                            "X".into(),
-                            Constraint::None,
-                        )]))),
-                        condvar: Condvar::new(),
-                    },
-                };
+                let env =
+                    ExecuteEnvironment::new(&behaviors, question.root.variable_list().into_iter());
 
                 let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
 
@@ -637,10 +724,13 @@ mod tests {
                     assert!(false);
                 }
 
-                assert_eq!(
-                    env.key_store.get_constraint("X".into()),
-                    Constraint::EqualTo(Atom::Atom("atom".into()))
-                );
+                if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                    env.key_store.get_constraint(&"X".into())
+                {
+                    assert_eq!(s, "atom");
+                } else {
+                    assert!(false);
+                };
             }
             _ => {
                 assert!(false);
@@ -661,16 +751,8 @@ mod tests {
                     )]),
                 };
 
-                let env = ExecuteEnvironment {
-                    behaviors: &behaviors,
-                    key_store: Constraints {
-                        constraints: Arc::new(Mutex::new(HashMap::from([(
-                            "X".into(),
-                            Constraint::None,
-                        )]))),
-                        condvar: Condvar::new(),
-                    },
-                };
+                let env =
+                    ExecuteEnvironment::new(&behaviors, question.root.variable_list().into_iter());
 
                 let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
 
@@ -678,10 +760,13 @@ mod tests {
                     assert!(false);
                 }
 
-                assert_eq!(
-                    env.key_store.get_constraint("X".into()),
-                    Constraint::EqualTo(Atom::Atom("Atom".into()))
-                );
+                if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                    env.key_store.get_constraint(&"X".into())
+                {
+                    assert_eq!(s, "Atom");
+                } else {
+                    assert!(false);
+                };
             }
             _ => {
                 assert!(false);
@@ -692,7 +777,7 @@ mod tests {
     #[test]
     fn question_test() {
         let mut code = "Human(I, !O) :: I=socrates -> O=y, I=knowledge -> O=n. ".to_string()
-            + " Die(I, !O) :: Human(I, !O)."
+            + " Die(I, O) :: Human(I, O)."
             + " ? Die(I, !O), I=socrates."
             + " ? Die(I, !O), I=knowledge.";
 
@@ -720,24 +805,29 @@ mod tests {
             Ok((ParseResult::Question(agent), remain)) => {
                 code = remain.into();
 
-                let constraints = Arc::new(Mutex::new(HashMap::new()));
                 // 実行
-                let environment = ExecuteEnvironment::new(&behaviors, constraints.clone());
+                let environment =
+                    ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
 
                 let res = agent.solve(&environment);
 
                 match res {
                     Ok(_) => {
-                        assert_eq!(
-                            constraints.lock().unwrap().to_owned(),
-                            HashMap::from([
-                                (
-                                    "I".into(),
-                                    Constraint::EqualTo(Atom::Atom("socrates".into()))
-                                ),
-                                ("O".into(), Constraint::EqualTo(Atom::Atom("y".into())))
-                            ])
-                        )
+                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                            environment.key_store.get_constraint(&"I".into())
+                        {
+                            assert_eq!(s, "socrates");
+                        } else {
+                            assert!(false);
+                        };
+
+                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                            environment.key_store.get_constraint(&"O".into())
+                        {
+                            assert_eq!(s, "y");
+                        } else {
+                            assert!(false);
+                        };
                     }
                     Err(_) => assert!(false),
                 }
@@ -750,24 +840,29 @@ mod tests {
             Ok((ParseResult::Question(agent), remain)) => {
                 assert!(remain.is_empty());
 
-                let constraints = Arc::new(Mutex::new(HashMap::new()));
                 // 実行
-                let environment = ExecuteEnvironment::new(&behaviors, constraints.clone());
+                let environment =
+                    ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
 
                 let res = agent.solve(&environment);
 
                 match res {
                     Ok(_) => {
-                        assert_eq!(
-                            constraints.lock().unwrap().to_owned(),
-                            HashMap::from([
-                                (
-                                    "I".into(),
-                                    Constraint::EqualTo(Atom::Atom("knowledge".into()))
-                                ),
-                                ("O".into(), Constraint::EqualTo(Atom::Atom("n".into())))
-                            ])
-                        )
+                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                            environment.key_store.get_constraint(&"I".into())
+                        {
+                            assert_eq!(s, "knowledge");
+                        } else {
+                            assert!(false);
+                        };
+
+                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                            environment.key_store.get_constraint(&"O".into())
+                        {
+                            assert_eq!(s, "n");
+                        } else {
+                            assert!(false);
+                        };
                     }
                     Err(_) => assert!(false),
                 }

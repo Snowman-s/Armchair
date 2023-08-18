@@ -1,5 +1,5 @@
 pub mod expressions {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
 
     use crate::{Atom, Constraint, ExecuteEnvironment};
 
@@ -8,14 +8,24 @@ pub mod expressions {
     }
 
     impl Expressions {
-        pub fn solve(&self, env: &ExecuteEnvironment) -> Atom {
+        pub fn solve(&self, env: &ExecuteEnvironment) -> Result<Atom, ()> {
             let mut stack = VecDeque::new();
 
             for expr in &self.exprs {
                 expr.apply(env, &mut stack);
             }
 
-            stack[0].clone()
+            stack.get(0).ok_or_else(|| ()).cloned()
+        }
+
+        pub fn variables(&self) -> HashSet<String> {
+            self.exprs
+                .iter()
+                .filter_map(|expr| match expr {
+                    Expression::Atom(_) => None,
+                    Expression::Variable(v) => Some(v.clone()),
+                })
+                .collect()
         }
     }
 
@@ -25,23 +35,18 @@ pub mod expressions {
     }
 
     impl Expression {
-        fn apply(&self, env: &ExecuteEnvironment, stack: &mut VecDeque<Atom>) {
+        fn apply(&self, env: &ExecuteEnvironment, stack: &mut VecDeque<Atom>) -> Result<(), ()> {
             match self {
                 Self::Atom(atom) => stack.push_front(atom.clone()),
                 Self::Variable(variable_id) => {
-                    let mut constraints_inner = env.key_store.constraints.lock().unwrap();
-                    loop {
-                        if let Some(Constraint::EqualTo(atom)) =
-                            constraints_inner.get(variable_id.into())
-                        {
-                            stack.push_front(atom.clone());
-                            break;
-                        }
-
-                        constraints_inner = env.key_store.condvar.wait(constraints_inner).unwrap();
-                    }
+                    stack.push_front(match env.key_store.wait_until_grounded(variable_id)? {
+                        Constraint::EqualTo(atom) => atom,
+                        _ => panic!(),
+                    });
                 }
-            }
+            };
+
+            return Ok(());
         }
     }
 }

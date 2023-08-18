@@ -34,17 +34,22 @@ fn main() {
                 Ok((ParseResult::Question(agent), code)) => {
                     builder = code.into();
 
-                    let constraints = Arc::new(Mutex::new(HashMap::new()));
                     // 実行
-                    let environment = ExecuteEnvironment::new(&behaviors, constraints.clone());
+                    let environment =
+                        ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
 
                     let res = agent.solve(&environment);
 
                     match res {
                         Ok(_) => {
-                            for (variable, constraint) in constraints.lock().unwrap().iter() {
-                                if let Constraint::EqualTo(atom) = constraint {
-                                    println!("{} = {};", variable, atom.to_string())
+                            for variable in agent.variable_list().iter() {
+                                match environment.key_store().get_constraint(variable) {
+                                    Ok(constraint) => {
+                                        if let Constraint::EqualTo(atom) = constraint {
+                                            println!("{} = {};", variable, atom.to_string())
+                                        }
+                                    }
+                                    Err(_) => {}
                                 }
                             }
                         }
