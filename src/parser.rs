@@ -108,6 +108,20 @@ pub mod parser {
     pub enum LexerExpressions {
         Variable(String),
         AtomString(String),
+        AtomNumber(Rational64),
+        TwoNumberCalc(
+            Box<LexerExpressions>,
+            Vec<(LexerTwoNumberCalcType, Box<LexerExpressions>)>,
+        ),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerTwoNumberCalcType {
+        Plus,
+        Minus,
+        Multiply,
+        Divide,
+        Mod,
     }
 
     impl LexerExpressions {
@@ -115,6 +129,24 @@ pub mod parser {
             match self {
                 LexerExpressions::Variable(v) => vec![Expression::Variable(v.into())],
                 LexerExpressions::AtomString(s) => vec![Expression::Atom(Atom::Atom(s.into()))],
+                LexerExpressions::AtomNumber(ratio) => vec![Expression::Atom(Atom::Number(*ratio))],
+                LexerExpressions::TwoNumberCalc(first, remain) => {
+                    let mut vec = first.to_vec();
+
+                    for (calc_type, expr) in remain {
+                        vec.extend(expr.to_vec());
+
+                        vec.push(Expression::TwoNumberCalc(match calc_type {
+                            LexerTwoNumberCalcType::Plus => TwoNumberCalcType::Plus,
+                            LexerTwoNumberCalcType::Minus => TwoNumberCalcType::Minus,
+                            LexerTwoNumberCalcType::Multiply => TwoNumberCalcType::Multiply,
+                            LexerTwoNumberCalcType::Divide => TwoNumberCalcType::Divide,
+                            LexerTwoNumberCalcType::Mod => TwoNumberCalcType::Mod,
+                        }));
+                    }
+
+                    vec
+                }
             }
         }
         fn compile(&self) -> Expressions {
@@ -137,15 +169,16 @@ pub mod parser {
             streaming::{take_while, take_while_m_n},
         },
         character::complete::multispace0,
-        character::streaming::{alpha1, char},
-        combinator::{map, opt, recognize},
-        multi::{many0, separated_list0, separated_list1},
+        character::streaming::char,
+        combinator::{map, not, opt, peek, recognize},
+        multi::{many0, many1, separated_list0, separated_list1},
         sequence::tuple,
         IResult,
     };
+    use num_rational::Rational64;
 
     use crate::{
-        expressions::expressions::{Expression, Expressions},
+        expressions::expressions::{Expression, Expressions, TwoNumberCalcType},
         Agent, AskAgent, AskTerm, AskTermAEqualB, Atom, Behavior, BehaviorParam, CallAgent,
         CallArgument, LinearAgent, TellAgent,
     };
@@ -402,8 +435,90 @@ pub mod parser {
 
     fn parse_expressions(code: &str) -> Res<LexerExpressions> {
         alt((
+            //2項演算 加減算
+            parse_two_number_add_expression,
+            //2項演算 乗除算
+            parse_two_number_multiply_expression,
+            // 単項
+            parse_expression_term,
+        ))(code)
+    }
+
+    fn parse_two_number_add_expression(code: &str) -> Res<LexerExpressions> {
+        map(
+            tuple((
+                alt((parse_two_number_multiply_expression, parse_expression_term)),
+                many1(tuple((
+                    multispace0,
+                    alt((
+                        map(char('+'), |_| LexerTwoNumberCalcType::Plus),
+                        map(
+                            tuple((peek(not(tuple((char('-'), char('>'))))), char('-'))),
+                            |_| LexerTwoNumberCalcType::Minus,
+                        ),
+                    )),
+                    multispace0,
+                    alt((parse_two_number_multiply_expression, parse_expression_term)),
+                ))),
+            )),
+            |(first, remain)| {
+                LexerExpressions::TwoNumberCalc(
+                    Box::new(first),
+                    remain
+                        .into_iter()
+                        .map(|(_, calctype, _, expr)| (calctype, Box::new(expr)))
+                        .collect(),
+                )
+            },
+        )(code)
+    }
+
+    fn parse_two_number_multiply_expression(code: &str) -> Res<LexerExpressions> {
+        map(
+            tuple((
+                parse_expression_term,
+                many1(tuple((
+                    multispace0,
+                    alt((
+                        map(char('*'), |_| LexerTwoNumberCalcType::Multiply),
+                        map(char('/'), |_| LexerTwoNumberCalcType::Divide),
+                        map(char('%'), |_| LexerTwoNumberCalcType::Mod),
+                    )),
+                    multispace0,
+                    parse_expression_term,
+                ))),
+            )),
+            |(first, remain)| {
+                LexerExpressions::TwoNumberCalc(
+                    Box::new(first),
+                    remain
+                        .into_iter()
+                        .map(|(_, calctype, _, expr)| (calctype, Box::new(expr)))
+                        .collect(),
+                )
+            },
+        )(code)
+    }
+
+    fn parse_expression_term(code: &str) -> Res<LexerExpressions> {
+        alt((
+            // 括弧式
+            map(
+                tuple((
+                    char('('),
+                    multispace0,
+                    parse_expressions,
+                    multispace0,
+                    char(')'),
+                )),
+                |(_, _, s, _, _)| s,
+            ),
             // 変数
             map(parse_variable, |s| LexerExpressions::Variable(s.into())),
+            // 有理数アトム
+            map(nom::character::streaming::i64, |decimal| {
+                LexerExpressions::AtomNumber(Rational64::new(decimal, 1))
+            }),
             // 文字列アトム
             map(
                 alt((
@@ -440,12 +555,14 @@ pub mod parser {
     #[cfg(test)]
     mod tests {
         use nom::Needed;
+        use num_rational::Rational64;
 
         use crate::parser::parser::{
-            LexerAgent, LexerBehavior, LexerExpressions, LexerTellAgent, ParseResult,
+            LexerAgent, LexerAskAgent, LexerAskTerm, LexerBehavior, LexerExpressions,
+            LexerTellAgent, LexerTwoNumberCalcType, ParseResult,
         };
 
-        use super::parse_behavior;
+        use super::{parse_ask_agent, parse_ask_term, parse_behavior};
 
         #[test]
         fn lexer_test() {
@@ -476,6 +593,57 @@ pub mod parser {
                     // do nothing (assert true)
                 }
                 _ => assert!(false),
+            }
+        }
+        #[test]
+        fn lexer_two_term_expression_test() {
+            match parse_ask_agent("10 / 6 + A - B * 3 = 20 -> a()") {
+                Ok((_, agent_enum)) => {
+                    if let LexerAgent::AskAgent(agent) = agent_enum {
+                        assert_eq!(
+                            agent.ask_term,
+                            LexerAskTerm::AEqualB(
+                                LexerExpressions::TwoNumberCalc(
+                                    Box::new(LexerExpressions::TwoNumberCalc(
+                                        Box::new(LexerExpressions::AtomNumber(Rational64::new(
+                                            10, 1
+                                        ))),
+                                        vec![(
+                                            LexerTwoNumberCalcType::Divide,
+                                            Box::new(LexerExpressions::AtomNumber(
+                                                Rational64::new(6, 1)
+                                            ))
+                                        )]
+                                    )),
+                                    vec![
+                                        (
+                                            LexerTwoNumberCalcType::Plus,
+                                            Box::new(LexerExpressions::Variable("A".to_string())),
+                                        ),
+                                        (
+                                            LexerTwoNumberCalcType::Minus,
+                                            Box::new(LexerExpressions::TwoNumberCalc(
+                                                Box::new(LexerExpressions::Variable(
+                                                    "B".to_string()
+                                                )),
+                                                vec![(
+                                                    LexerTwoNumberCalcType::Multiply,
+                                                    Box::new(LexerExpressions::AtomNumber(
+                                                        Rational64::new(3, 1)
+                                                    ))
+                                                )]
+                                            ))
+                                        )
+                                    ]
+                                ),
+                                LexerExpressions::AtomNumber(Rational64::new(20, 1))
+                            )
+                        );
+                    } else {
+                        assert!(false);
+                    }
+                }
+                Err(_) => assert!(false),
             }
         }
     }
