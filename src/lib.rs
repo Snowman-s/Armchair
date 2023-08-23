@@ -74,49 +74,6 @@ impl Constraints {
         }
     }
 
-    /**
-     * this function blocks execution until conforming "guard",
-     *
-     * Both arguments' and params' length must be same.
-     *
-     * "initilize_variable" is used for "inner" variables.
-     * If it's an element already in param, it is ignored.
-     */
-    fn copy_to_new_constraint(
-        &self,
-        arguments: &Vec<CallArgument>,
-        param: &Vec<BehaviorParam>,
-        initilize_variable_list: impl Iterator<Item = String>,
-    ) -> Result<Constraints, ()> {
-        let mut new_constraints = HashMap::new();
-
-        for (index, argument) in arguments.iter().enumerate() {
-            let new_variable = match argument {
-                CallArgument::Asker(argument_variable) => {
-                    self.get_ask_argument_rights(argument_variable)
-                }
-                CallArgument::Teller(argument_variable) => self.get_tell_rights(argument_variable),
-            }?;
-            new_constraints.insert(param[index].get_variable_name().clone(), new_variable);
-        }
-
-        for init in initilize_variable_list {
-            if !new_constraints.contains_key(&init) {
-                new_constraints.insert(
-                    init.clone(),
-                    (
-                        Arc::new(Mutex::new(VariableRight::All)),
-                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
-                    ),
-                );
-            }
-        }
-
-        Ok(Constraints {
-            constraints: new_constraints,
-        })
-    }
-
     fn tell(&self, variable_id: String, told: Constraint) -> Result<(), ()> {
         let (_, original_cons_arc) = self.get_tell_rights(&variable_id)?;
 
@@ -252,6 +209,44 @@ impl ExecuteEnvironment<'_> {
     pub fn key_store(&self) -> &Constraints {
         &self.key_store
     }
+
+    /**
+     * this function blocks execution until conforming "guard",
+     *
+     * Both arguments' and params' length must be same.
+     *
+     * "initilize_variable" is used for "inner" variables.
+     * If it's an element already in param, it is ignored.
+     */
+    fn create_and_copy_to_new_constraint(
+        &self,
+        arguments: &Vec<CallArgument>,
+        param: &Vec<BehaviorParam>,
+        initilize_variables: impl Iterator<Item = String>,
+    ) -> Result<Constraints, ()> {
+        let mut new_constraints = HashMap::new();
+
+        for (index, argument) in arguments.iter().enumerate() {
+            let p = param.get(index).ok_or(())?;
+            argument.apply_to_new_constraint(self, &mut new_constraints, &param[index])?;
+        }
+
+        for init in initilize_variables {
+            if !new_constraints.contains_key(&init) {
+                new_constraints.insert(
+                    init.clone(),
+                    (
+                        Arc::new(Mutex::new(VariableRight::All)),
+                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                    ),
+                );
+            }
+        }
+
+        Ok(Constraints {
+            constraints: new_constraints,
+        })
+    }
 }
 
 pub struct Behavior {
@@ -275,7 +270,7 @@ impl BehaviorParam {
 
 pub trait Agent: Send + Sync {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()>;
-    fn variable_list(&self) -> HashSet<String>;
+    fn variables(&self) -> HashSet<String>;
 }
 
 fn call(
@@ -285,10 +280,10 @@ fn call(
 ) -> Result<(), ()> {
     let new_environment = ExecuteEnvironment {
         behaviors: env.behaviors,
-        key_store: env.key_store.copy_to_new_constraint(
+        key_store: env.create_and_copy_to_new_constraint(
             argument_variables,
             &question.param_list,
-            question.root.variable_list().into_iter(),
+            question.root.variables().into_iter(),
         )?,
     };
 
@@ -311,7 +306,7 @@ impl Agent for TellAgent {
             .tell(self.variable_id.clone(), Constraint::EqualTo(expr_solved))
     }
 
-    fn variable_list(&self) -> HashSet<String> {
+    fn variables(&self) -> HashSet<String> {
         let mut expr: HashSet<String> = self.expression.variables();
         expr.insert(self.variable_id.clone());
         expr
@@ -327,27 +322,69 @@ fn create_tell_agent(variable_id: String, expr: Expressions) -> Box<dyn Agent> {
 
 struct CallAgent {
     behavior_name: String,
-    argument_variable_list: Vec<CallArgument>,
+    argument_variables: Vec<CallArgument>,
 }
 
 enum CallArgument {
     Asker(String),
     Teller(String),
+    Expression(Expressions),
 }
 
 impl CallArgument {
-    fn get_variable_name(&self) -> &String {
+    fn variables(&self) -> HashSet<String> {
         match self {
-            CallArgument::Asker(s) => s,
-            CallArgument::Teller(s) => s,
+            CallArgument::Asker(v) => {
+                let mut ret = HashSet::new();
+                ret.insert(v.clone());
+                ret
+            }
+            CallArgument::Teller(v) => {
+                let mut ret = HashSet::new();
+                ret.insert(v.clone());
+                ret
+            }
+            CallArgument::Expression(expr) => expr.variables(),
+        }
+    }
+
+    fn apply_to_new_constraint(
+        &self,
+        now_env: &ExecuteEnvironment,
+        creating_cons: &mut HashMap<String, VariableInfo>,
+        param: &BehaviorParam,
+    ) -> Result<(), ()> {
+        match self {
+            CallArgument::Asker(v) => {
+                let new_variable = now_env.key_store.get_ask_argument_rights(v)?;
+                creating_cons.insert(param.get_variable_name().clone(), new_variable);
+                Ok(())
+            }
+            CallArgument::Teller(v) => {
+                let new_variable = now_env.key_store.get_tell_rights(v)?;
+                creating_cons.insert(param.get_variable_name().clone(), new_variable);
+                Ok(())
+            }
+            CallArgument::Expression(expr) => {
+                let expr_solved = expr.solve(now_env)?;
+
+                creating_cons.insert(
+                    param.get_variable_name().clone(),
+                    (
+                        Arc::new(Mutex::new(VariableRight::Askable)),
+                        Arc::new((Mutex::new(Constraint::EqualTo(expr_solved)), Condvar::new())),
+                    ),
+                );
+                Ok(())
+            }
         }
     }
 }
 
 impl Agent for CallAgent {
     fn solve(&self, environment: &ExecuteEnvironment<'_>) -> Result<(), ()> {
-        let a = environment.behaviors.get(&self.behavior_name).unwrap();
-        let call_result = call(environment, a, &self.argument_variable_list);
+        let a = environment.behaviors.get(&self.behavior_name).ok_or(())?;
+        let call_result = call(environment, a, &self.argument_variables);
         if let Ok(_) = call_result {
             return Ok(());
         } else {
@@ -355,21 +392,21 @@ impl Agent for CallAgent {
         }
     }
 
-    fn variable_list(&self) -> HashSet<String> {
-        self.argument_variable_list
+    fn variables(&self) -> HashSet<String> {
+        self.argument_variables
             .iter()
-            .map(|arg| arg.get_variable_name().clone())
+            .flat_map(|arg| arg.variables())
             .collect()
     }
 }
 
 fn create_call_agent(
     behavior_name: String,
-    argument_variable_list: Vec<CallArgument>,
+    argument_variables: Vec<CallArgument>,
 ) -> Box<dyn Agent> {
     Box::new(CallAgent {
         behavior_name,
-        argument_variable_list,
+        argument_variables,
     })
 }
 
@@ -401,10 +438,10 @@ impl Agent for LinearAgent {
         return result;
     }
 
-    fn variable_list(&self) -> HashSet<String> {
+    fn variables(&self) -> HashSet<String> {
         self.children
             .iter()
-            .flat_map(|child| child.variable_list())
+            .flat_map(|child| child.variables())
             .collect()
     }
 }
@@ -429,10 +466,10 @@ impl Agent for AskAgent {
         }
     }
 
-    fn variable_list(&self) -> HashSet<String> {
+    fn variables(&self) -> HashSet<String> {
         let mut ret = self.ask_term.variables();
 
-        ret.extend(self.then.variable_list());
+        ret.extend(self.then.variables());
 
         ret
     }
@@ -552,7 +589,7 @@ mod tests {
 
         let question = create_call_agent("A".into(), vec![CallArgument::Teller("X".into())]);
 
-        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
+        let env = ExecuteEnvironment::new(&behaviors, question.variables().into_iter());
 
         if let Err(_) = question.solve(&env) {
             assert!(false);
@@ -609,7 +646,7 @@ mod tests {
             create_call_agent("B".into(), vec![CallArgument::Teller("Y".into())]),
         ]);
 
-        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
+        let env = ExecuteEnvironment::new(&behaviors, question.variables().into_iter());
 
         let call_result = question.solve(&env);
 
@@ -683,7 +720,7 @@ mod tests {
 
         let question = create_call_agent("B".into(), vec![CallArgument::Teller("X".into())]);
 
-        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
+        let env = ExecuteEnvironment::new(&behaviors, question.variables().into_iter());
 
         let call_result = question.solve(&env);
 
@@ -735,7 +772,7 @@ mod tests {
             vec![CallArgument::Teller("X".into())],
         )]);
 
-        let env = ExecuteEnvironment::new(&behaviors, question.variable_list().into_iter());
+        let env = ExecuteEnvironment::new(&behaviors, question.variables().into_iter());
 
         let call_result = question.solve(&env);
 
@@ -766,7 +803,7 @@ mod tests {
                 };
 
                 let env =
-                    ExecuteEnvironment::new(&behaviors, question.root.variable_list().into_iter());
+                    ExecuteEnvironment::new(&behaviors, question.root.variables().into_iter());
 
                 let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
 
@@ -802,7 +839,7 @@ mod tests {
                 };
 
                 let env =
-                    ExecuteEnvironment::new(&behaviors, question.root.variable_list().into_iter());
+                    ExecuteEnvironment::new(&behaviors, question.root.variables().into_iter());
 
                 let call_result = call(&env, &question, &vec![CallArgument::Teller("X".into())]);
 
@@ -829,7 +866,7 @@ mod tests {
         let mut code = "Human(I, !O) :: I=socrates -> O=y, I=knowledge -> O=n. ".to_string()
             + " Die(I, O) :: Human(I, O)."
             + " ? Die(I, !O), I=socrates."
-            + " ? Die(I, !O), I=knowledge.";
+            + " ? Die(knowledge, !O).";
 
         let mut behaviors = HashMap::new();
 
@@ -857,7 +894,7 @@ mod tests {
 
                 // 実行
                 let environment =
-                    ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
+                    ExecuteEnvironment::new(&behaviors, agent.variables().into_iter());
 
                 let res = agent.solve(&environment);
 
@@ -892,20 +929,12 @@ mod tests {
 
                 // 実行
                 let environment =
-                    ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
+                    ExecuteEnvironment::new(&behaviors, agent.variables().into_iter());
 
                 let res = agent.solve(&environment);
 
                 match res {
                     Ok(_) => {
-                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
-                            environment.key_store.get_constraint(&"I".into())
-                        {
-                            assert_eq!(s, "knowledge");
-                        } else {
-                            assert!(false);
-                        };
-
                         if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
                             environment.key_store.get_constraint(&"O".into())
                         {

@@ -35,7 +35,7 @@ pub mod parser {
                 }),
                 LexerAgent::CallAgent(lexer) => Box::new(CallAgent {
                     behavior_name: lexer.behavior_name.clone(),
-                    argument_variable_list: lexer
+                    argument_variables: lexer
                         .argument_variable_list
                         .iter()
                         .map(|s| match s {
@@ -44,6 +44,9 @@ pub mod parser {
                             }
                             LexerCallArgument::Teller(variable) => {
                                 CallArgument::Teller(variable.into())
+                            }
+                            LexerCallArgument::Expression(expr) => {
+                                CallArgument::Expression(expr.compile())
                             }
                         })
                         .collect(),
@@ -75,6 +78,7 @@ pub mod parser {
     pub enum LexerCallArgument {
         Asker(String),
         Teller(String),
+        Expression(LexerExpressions),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -380,7 +384,15 @@ pub mod parser {
                 tuple((char('!'), multispace0, parse_variable)),
                 |(_, _, v)| LexerCallArgument::Teller(v.into()),
             ),
-            map(parse_variable, |v| LexerCallArgument::Asker(v.into())),
+            map(
+                tuple((
+                    parse_variable,
+                    multispace0,
+                    peek(alt((char(','), char(')')))),
+                )),
+                |(v, _, _)| LexerCallArgument::Asker(v.into()),
+            ),
+            map(parse_expressions, |e| LexerCallArgument::Expression(e)),
         ))(code)
     }
 

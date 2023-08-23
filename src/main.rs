@@ -35,13 +35,13 @@ fn main() {
 
                     // 実行
                     let environment =
-                        ExecuteEnvironment::new(&behaviors, agent.variable_list().into_iter());
+                        ExecuteEnvironment::new(&behaviors, agent.variables().into_iter());
 
                     let res = agent.solve(&environment);
 
                     match res {
                         Ok(_) => {
-                            for variable in agent.variable_list().iter() {
+                            for variable in agent.variables().iter() {
                                 match environment.key_store().get_constraint(variable) {
                                     Ok(constraint) => {
                                         if let Constraint::EqualTo(atom) = constraint {
