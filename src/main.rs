@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     io::{self, Write},
-    sync::{Arc, Mutex},
 };
 
 use armchair::{

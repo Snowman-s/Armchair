@@ -442,30 +442,77 @@ fn create_ask_agent(ask_term: Box<dyn AskTerm>, then: Box<dyn Agent>) -> Box<dyn
     Box::new(AskAgent { ask_term, then })
 }
 
-struct AskTermAEqualB {
-    left: Expressions,
-    right: Expressions,
+struct AskTermVec {
+    first: Expressions,
+    remain: Vec<(AskTermOp, Expressions)>,
 }
 
-impl AskTerm for AskTermAEqualB {
-    fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult {
-        if self.left.solve(constraints) == self.right.solve(constraints) {
-            ConstraintCheckResult::SUCCEED
+enum AskTermOp {
+    AEqualB,
+    AGTB,
+    ALTB,
+    AGEB,
+    ALEB,
+}
+
+impl AskTermOp {
+    fn test(&self, a: &Atom, b: &Atom) -> bool {
+        if let AskTermOp::AEqualB = self {
+            a == b
         } else {
-            ConstraintCheckResult::CONTRADICTION
+            if let Atom::Number(a_number) = a {
+                if let Atom::Number(b_number) = b {
+                    return match self {
+                        AskTermOp::AGTB => a_number > b_number,
+                        AskTermOp::ALTB => a_number < b_number,
+                        AskTermOp::AGEB => a_number >= b_number,
+                        AskTermOp::ALEB => a_number <= b_number,
+                        AskTermOp::AEqualB => panic!(),
+                    };
+                }
+            }
+            panic!()
         }
+    }
+}
+
+impl AskTerm for AskTermVec {
+    fn prove(&self, env: &ExecuteEnvironment) -> ConstraintCheckResult {
+        let mut expr_cache = if let Ok(a) = self.first.solve(env) {
+            a
+        } else {
+            return ConstraintCheckResult::CONTRADICTION;
+        };
+
+        for (op, expr) in &self.remain {
+            let expr_solved = if let Ok(a) = expr.solve(env) {
+                a
+            } else {
+                return ConstraintCheckResult::CONTRADICTION;
+            };
+
+            if !op.test(&expr_cache, &expr_solved) {
+                return ConstraintCheckResult::CONTRADICTION;
+            }
+
+            expr_cache = expr_solved;
+        }
+
+        ConstraintCheckResult::SUCCEED
     }
 
     fn variables(&self) -> HashSet<String> {
-        let mut ret = self.left.variables();
-        ret.extend(self.right.variables());
+        let mut ret = HashSet::from(self.first.variables());
+        for (_, expr) in &self.remain {
+            ret.extend(expr.variables());
+        }
 
         ret
     }
 }
 
-fn create_ask_term_a_equal_b(left: Expressions, right: Expressions) -> Box<dyn AskTerm> {
-    Box::new(AskTermAEqualB { left, right })
+fn create_ask_term(first: Expressions, remain: Vec<(AskTermOp, Expressions)>) -> Box<dyn AskTerm> {
+    Box::new(AskTermVec { first, remain })
 }
 
 #[cfg(test)]
@@ -473,11 +520,11 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        call, create_ask_agent, create_ask_term_a_equal_b, create_call_agent, create_linear_agent,
+        call, create_ask_agent, create_ask_term, create_call_agent, create_linear_agent,
         create_tell_agent,
         expressions::expressions::{Expression, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
-        Atom, Behavior, BehaviorParam, CallArgument, Constraint, ExecuteEnvironment,
+        AskTermOp, Atom, Behavior, BehaviorParam, CallArgument, Constraint, ExecuteEnvironment,
     };
 
     #[test]
@@ -610,13 +657,16 @@ mod tests {
                     param_list: vec![BehaviorParam::Teller("O".into())],
                     root: create_linear_agent(vec![
                         create_ask_agent(
-                            create_ask_term_a_equal_b(
+                            create_ask_term(
                                 Expressions {
                                     exprs: vec![Expression::Variable("I".into())],
                                 },
-                                Expressions {
-                                    exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
-                                },
+                                vec![(
+                                    AskTermOp::AEqualB,
+                                    Expressions {
+                                        exprs: vec![Expression::Atom(Atom::Atom("AAAAA".into()))],
+                                    },
+                                )],
                             ),
                             create_tell_agent(
                                 "O".into(),

@@ -84,18 +84,40 @@ pub mod parser {
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    pub enum LexerAskTerm {
-        AEqualB(LexerExpressions, LexerExpressions),
+    pub struct LexerAskTerm {
+        first: LexerExpressions,
+        remain: Vec<(LexerAskTermOp, LexerExpressions)>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerAskTermOp {
+        AEqualB,
+        AGTB,
+        AGEB,
+        ALTB,
+        ALEB,
+    }
+    impl LexerAskTermOp {
+        fn compile(&self) -> AskTermOp {
+            match self {
+                LexerAskTermOp::AEqualB => AskTermOp::AEqualB,
+                LexerAskTermOp::AGTB => AskTermOp::AGTB,
+                LexerAskTermOp::AGEB => AskTermOp::AGEB,
+                LexerAskTermOp::ALTB => AskTermOp::ALTB,
+                LexerAskTermOp::ALEB => AskTermOp::ALEB,
+            }
+        }
     }
 
     impl LexerAskTerm {
         fn compile(&self) -> Box<dyn AskTerm> {
-            Box::new(match self {
-                Self::AEqualB(left, right) => AskTermAEqualB {
-                    left: left.compile(),
-                    right: right.compile(),
-                },
-            })
+            create_ask_term(
+                self.first.compile(),
+                self.remain
+                    .iter()
+                    .map(|(a, b)| (a.compile(), b.compile()))
+                    .collect(),
+            )
         }
     }
 
@@ -178,8 +200,9 @@ pub mod parser {
     use num_rational::Rational64;
 
     use crate::{
+        create_ask_term,
         expressions::expressions::{Expression, Expressions, TwoNumberCalcType},
-        Agent, AskAgent, AskTerm, AskTermAEqualB, Atom, Behavior, BehaviorParam, CallAgent,
+        Agent, AskAgent, AskTerm, AskTermOp, Atom, Behavior, BehaviorParam, CallAgent,
         CallArgument, LinearAgent, TellAgent,
     };
 
@@ -384,13 +407,25 @@ pub mod parser {
         map(
             tuple((
                 parse_expressions,
-                multispace0,
-                char('='),
-                multispace0,
-                parse_expressions,
+                many1(tuple((
+                    multispace0,
+                    alt((
+                        map(char('='), |_| LexerAskTermOp::AEqualB),
+                        map(tuple((char('<'), char('='))), |_| LexerAskTermOp::ALEB),
+                        map(tuple((char('>'), char('='))), |_| LexerAskTermOp::AGEB),
+                        map(char('<'), |_| LexerAskTermOp::ALTB),
+                        map(char('>'), |_| LexerAskTermOp::AGTB),
+                    )),
+                    multispace0,
+                    parse_expressions,
+                ))),
             )),
-            |(leftside, _, _, _, rightside): (LexerExpressions, _, _, _, LexerExpressions)| {
-                LexerAskTerm::AEqualB(leftside, rightside)
+            |(first, remain)| LexerAskTerm {
+                first: first,
+                remain: remain
+                    .into_iter()
+                    .map(|(_, op, _, expr): (_, LexerAskTermOp, _, LexerExpressions)| (op, expr))
+                    .collect(),
             },
         )(code)
     }
@@ -558,11 +593,11 @@ pub mod parser {
         use num_rational::Rational64;
 
         use crate::parser::parser::{
-            LexerAgent, LexerAskAgent, LexerAskTerm, LexerBehavior, LexerExpressions,
+            LexerAgent, LexerAskTerm, LexerAskTermOp, LexerBehavior, LexerExpressions,
             LexerTellAgent, LexerTwoNumberCalcType, ParseResult,
         };
 
-        use super::{parse_ask_agent, parse_ask_term, parse_behavior};
+        use super::{parse_ask_agent, parse_behavior};
 
         #[test]
         fn lexer_test() {
@@ -598,12 +633,13 @@ pub mod parser {
         #[test]
         fn lexer_two_term_expression_test() {
             match parse_ask_agent("10 / 6 + A - B * 3 = 20 -> a()") {
+                Err(_) => assert!(false),
                 Ok((_, agent_enum)) => {
                     if let LexerAgent::AskAgent(agent) = agent_enum {
                         assert_eq!(
                             agent.ask_term,
-                            LexerAskTerm::AEqualB(
-                                LexerExpressions::TwoNumberCalc(
+                            LexerAskTerm {
+                                first: LexerExpressions::TwoNumberCalc(
                                     Box::new(LexerExpressions::TwoNumberCalc(
                                         Box::new(LexerExpressions::AtomNumber(Rational64::new(
                                             10, 1
@@ -636,14 +672,45 @@ pub mod parser {
                                         )
                                     ]
                                 ),
-                                LexerExpressions::AtomNumber(Rational64::new(20, 1))
-                            )
+                                remain: vec![(
+                                    LexerAskTermOp::AEqualB,
+                                    LexerExpressions::AtomNumber(Rational64::new(20, 1))
+                                )]
+                            }
                         );
                     } else {
                         assert!(false);
                     }
                 }
+            }
+        }
+
+        #[test]
+        fn lexer_long_ask_term_test() {
+            match parse_ask_agent("10 = 20 >= A <= B > A < C -> a()") {
                 Err(_) => assert!(false),
+                Ok((_, agent_enum)) => {
+                    if let LexerAgent::AskAgent(agent) = agent_enum {
+                        assert_eq!(
+                            agent.ask_term,
+                            LexerAskTerm {
+                                first: LexerExpressions::AtomNumber(10.into()),
+                                remain: vec![
+                                    (
+                                        LexerAskTermOp::AEqualB,
+                                        LexerExpressions::AtomNumber(20.into())
+                                    ),
+                                    (LexerAskTermOp::AGEB, LexerExpressions::Variable("A".into())),
+                                    (LexerAskTermOp::ALEB, LexerExpressions::Variable("B".into())),
+                                    (LexerAskTermOp::AGTB, LexerExpressions::Variable("A".into())),
+                                    (LexerAskTermOp::ALTB, LexerExpressions::Variable("C".into())),
+                                ],
+                            }
+                        )
+                    } else {
+                        assert!(false)
+                    }
+                }
             }
         }
     }

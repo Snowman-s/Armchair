@@ -47,8 +47,8 @@ pub mod expressions {
                         _ => panic!(),
                     });
                 }
-                Expression::TwoNumberCalc(calcType) => {
-                    self.two_number_calc(stack, calcType.get_func())?
+                Expression::TwoNumberCalc(calc_type) => {
+                    self.two_number_calc(stack, calc_type.get_func())?
                 }
             };
 
