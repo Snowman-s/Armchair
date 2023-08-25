@@ -135,10 +135,17 @@ pub mod parser {
         Variable(String),
         AtomString(String),
         AtomNumber(Rational64),
+        Compound(String, Vec<LexerCompoundArgument>),
         TwoNumberCalc(
             Box<LexerExpressions>,
             Vec<(LexerTwoNumberCalcType, Box<LexerExpressions>)>,
         ),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerCompoundArgument {
+        Variable(String),
+        Other(Box<LexerExpressions>),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -156,6 +163,32 @@ pub mod parser {
                 LexerExpressions::Variable(v) => vec![Expression::Variable(v.into())],
                 LexerExpressions::AtomString(s) => vec![Expression::Atom(Atom::Atom(s.into()))],
                 LexerExpressions::AtomNumber(ratio) => vec![Expression::Atom(Atom::Number(*ratio))],
+                LexerExpressions::Compound(name, args) => {
+                    let mut compiled = vec![];
+
+                    for arg in args.iter().rev() {
+                        match arg {
+                            LexerCompoundArgument::Variable(_) => {}
+                            LexerCompoundArgument::Other(expr) => compiled.extend(expr.to_vec()),
+                        }
+                    }
+
+                    compiled.push(Expression::Compound(
+                        name.to_string(),
+                        args.into_iter()
+                            .map(|a| match a {
+                                LexerCompoundArgument::Variable(v) => {
+                                    ExpressionCompoundArg::Variable(v.to_string())
+                                }
+                                LexerCompoundArgument::Other(_) => {
+                                    ExpressionCompoundArg::Expression
+                                }
+                            })
+                            .collect(),
+                    ));
+
+                    compiled
+                }
                 LexerExpressions::TwoNumberCalc(first, remain) => {
                     let mut vec = first.to_vec();
 
@@ -205,7 +238,9 @@ pub mod parser {
 
     use crate::{
         create_ask_term,
-        expressions::expressions::{Expression, Expressions, TwoNumberCalcType},
+        expressions::expressions::{
+            Expression, ExpressionCompoundArg, Expressions, TwoNumberCalcType,
+        },
         Agent, AskAgent, AskTerm, AskTermOp, Atom, Behavior, BehaviorParam, CallAgent,
         CallArgument, LinearAgent, TellAgent,
     };
@@ -560,6 +595,32 @@ pub mod parser {
                 )),
                 |(_, _, s, _, _)| s,
             ),
+            // コンパウンド
+            map(
+                tuple((
+                    parse_until_non_symbol,
+                    multispace0,
+                    char('('),
+                    multispace0,
+                    separated_list0(
+                        tuple((multispace0, char(','), multispace0)),
+                        alt((
+                            map(
+                                tuple((
+                                    parse_variable,
+                                    peek(tuple((multispace0, alt((char(','), char(')')))))),
+                                )),
+                                |(v, _)| LexerCompoundArgument::Variable(v.to_string()),
+                            ),
+                            map(parse_expressions, |v| {
+                                LexerCompoundArgument::Other(Box::new(v))
+                            }),
+                        )),
+                    ),
+                    char(')'),
+                )),
+                |(name, _, _, _, vec, _)| LexerExpressions::Compound(name.to_string(), vec),
+            ),
             // 変数
             map(parse_variable, |s| LexerExpressions::Variable(s.into())),
             // 有理数アトム
@@ -605,11 +666,11 @@ pub mod parser {
         use num_rational::Rational64;
 
         use crate::parser::parser::{
-            LexerAgent, LexerAskTerm, LexerAskTermOp, LexerBehavior, LexerExpressions,
-            LexerTellAgent, LexerTwoNumberCalcType, ParseResult,
+            LexerAgent, LexerAskTerm, LexerAskTermOp, LexerBehavior, LexerCompoundArgument,
+            LexerExpressions, LexerTellAgent, LexerTwoNumberCalcType, ParseResult,
         };
 
-        use super::{parse_ask_agent, parse_behavior};
+        use super::{parse_ask_agent, parse_behavior, parse_tell_agent};
 
         #[test]
         fn lexer_test() {
@@ -722,6 +783,32 @@ pub mod parser {
                     } else {
                         assert!(false)
                     }
+                }
+            }
+        }
+
+        #[test]
+        fn lexer_compound() {
+            match parse_tell_agent("X = a((A), V).") {
+                Ok((_, LexerAgent::TellAgent(agent))) => {
+                    assert_eq!(
+                        agent,
+                        LexerTellAgent {
+                            variable: "X".to_string(),
+                            expression: LexerExpressions::Compound(
+                                "a".to_string(),
+                                vec![
+                                    LexerCompoundArgument::Other(Box::new(
+                                        LexerExpressions::Variable("A".to_string())
+                                    )),
+                                    LexerCompoundArgument::Variable("V".to_string())
+                                ]
+                            )
+                        }
+                    )
+                }
+                _ => {
+                    assert!(false);
                 }
             }
         }

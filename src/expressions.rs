@@ -3,7 +3,7 @@ pub mod expressions {
 
     use num_rational::Rational64;
 
-    use crate::{Atom, Constraint, ExecuteEnvironment};
+    use crate::{Atom, CompoundArg, Constraint, ExecuteEnvironment};
 
     pub struct Expressions {
         pub exprs: Vec<Expression>,
@@ -23,9 +23,16 @@ pub mod expressions {
         pub fn variables(&self) -> HashSet<String> {
             self.exprs
                 .iter()
-                .filter_map(|expr| match expr {
-                    Expression::Variable(v) => Some(v.clone()),
-                    _ => None,
+                .flat_map(|expr| match expr {
+                    Expression::Variable(v) => vec![v.clone()],
+                    Expression::Compound(_, args) => args
+                        .iter()
+                        .filter_map(|s| match s {
+                            ExpressionCompoundArg::Expression => None,
+                            ExpressionCompoundArg::Variable(v) => Some(v.clone()),
+                        })
+                        .collect(),
+                    _ => vec![],
                 })
                 .collect()
         }
@@ -34,7 +41,13 @@ pub mod expressions {
     pub enum Expression {
         Atom(Atom),
         Variable(String),
+        Compound(String, Vec<ExpressionCompoundArg>),
         TwoNumberCalc(TwoNumberCalcType),
+    }
+
+    pub enum ExpressionCompoundArg {
+        Expression,
+        Variable(String),
     }
 
     impl Expression {
@@ -49,6 +62,25 @@ pub mod expressions {
                 }
                 Expression::TwoNumberCalc(calc_type) => {
                     self.two_number_calc(stack, calc_type.get_func())?
+                }
+                Expression::Compound(name, args) => {
+                    let mut comp_arg: Vec<CompoundArg> = vec![];
+
+                    for exp_comp_arg in args {
+                        match exp_comp_arg {
+                            ExpressionCompoundArg::Expression => {
+                                let pop = stack.pop_front().ok_or(())?;
+                                comp_arg.push(CompoundArg::Atom(pop));
+                            }
+                            ExpressionCompoundArg::Variable(variable) => {
+                                let v_info = env.key_store.constraints.get(variable).ok_or(())?;
+
+                                comp_arg.push(CompoundArg::Variable(v_info.clone()));
+                            }
+                        }
+                    }
+
+                    stack.push_front(Atom::Compound(name.to_string(), comp_arg));
                 }
             };
 

@@ -13,18 +13,132 @@ trait AskTerm: Send + Sync {
     fn variables(&self) -> HashSet<String>;
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum Constraint {
     None,
     EqualTo(Atom),
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum Atom {
     /** 真なるアトム (Stringは名前としての存在であってコードからは参照すべきではない) */
     Atom(String),
     /** 数値としてのアトム */
     Number(Rational64),
+    /** 変数参照可 複合アトム */
+    Compound(String, Vec<CompoundArg>),
+}
+
+impl Atom {
+    fn eq(a: &Atom, b: &Atom) -> bool {
+        let mut equal_vec = vec![(a.clone(), b.clone())];
+
+        while let Some((a_cache, b_cache)) = equal_vec.pop() {
+            match a_cache {
+                Atom::Atom(a_str) => {
+                    if let Atom::Atom(b_str) = b_cache {
+                        if a_str == b_str {
+                            continue;
+                        }
+                    }
+                    return false;
+                }
+                Atom::Number(a_num) => {
+                    if let Atom::Number(b_num) = b_cache {
+                        //do nothing (passed test)
+                        if a_num == b_num {
+                            continue;
+                        }
+                    }
+                    return false;
+                }
+                Atom::Compound(a_name, a_args) => {
+                    if let Atom::Compound(b_name, b_args) = b_cache {
+                        if a_name != b_name || a_args.len() != b_args.len() {
+                            return false;
+                        }
+
+                        for (index, _) in a_args.iter().enumerate() {
+                            let result = CompoundArg::eq_if_returned_thing_is_eq(
+                                &a_args[index],
+                                &b_args[index],
+                            );
+                            if let Some(r) = result {
+                                equal_vec.extend(r);
+                            } else {
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum CompoundArg {
+    Atom(Atom),
+    Variable(VariableInfo),
+}
+
+impl CompoundArg {
+    /**
+     if return None, they cannot be equal.
+    */
+    fn eq_if_returned_thing_is_eq<'a, 'b>(
+        a: &'a CompoundArg,
+        b: &'a CompoundArg,
+    ) -> Option<Vec<(Atom, Atom)>> {
+        if let CompoundArg::Variable((a_right, a_variable)) = a {
+            if let CompoundArg::Variable((b_right, b_variable)) = b {
+                // どちらも変数の場合の処理
+                if !(Arc::ptr_eq(&a_right, &b_right)
+                    || *a_right.lock().unwrap() == *b_right.lock().unwrap())
+                {
+                    return None;
+                }
+
+                if Arc::ptr_eq(&a_variable, &b_variable) {
+                    return Some(vec![]);
+                }
+            }
+        }
+
+        let func = |arg: CompoundArg| match arg {
+            CompoundArg::Atom(a_atom) => Some(a_atom.clone()),
+            CompoundArg::Variable((a_right, a_variable)) => {
+                if VariableRight::Askable != *a_right.lock().unwrap() {
+                    return None;
+                }
+
+                let (cons, cond) = &*a_variable;
+                let mut cons_locked = cons.lock().unwrap();
+                loop {
+                    if let Constraint::EqualTo(atom) = cons_locked.clone() {
+                        break Some(atom.clone());
+                    }
+
+                    cons_locked = cond.wait(cons_locked).unwrap();
+                }
+            }
+        };
+
+        let a_expr: Option<Atom> = (func)(a.clone());
+        if let None = a_expr {
+            return None;
+        }
+        let b_expr: Option<Atom> = (func)(b.clone());
+        if let None = b_expr {
+            return None;
+        }
+
+        Some(vec![(a_expr.unwrap(), b_expr.unwrap())])
+    }
 }
 
 impl ToString for Atom {
@@ -32,6 +146,34 @@ impl ToString for Atom {
         match self {
             Atom::Atom(atom) => format!("\'{}\'", atom),
             Atom::Number(rational) => rational.to_string(),
+            Atom::Compound(comp, args) => {
+                let arg_str: String = args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arg)| {
+                        let target = match arg {
+                            CompoundArg::Atom(atom) => atom.to_string(),
+                            CompoundArg::Variable((right, cons_arc)) => {
+                                if let VariableRight::Tellable = *right.lock().unwrap() {
+                                    "!".to_string()
+                                } else {
+                                    match cons_arc.0.lock().unwrap().clone() {
+                                        Constraint::EqualTo(atom) => atom.to_string(),
+                                        Constraint::None => "*".to_string(),
+                                    }
+                                }
+                            }
+                        };
+                        if idx == 0 {
+                            format!("{}", target)
+                        } else {
+                            format!(", {}", target)
+                        }
+                    })
+                    .collect();
+
+                format!("{}({})", comp, arg_str)
+            }
         }
     }
 }
@@ -41,7 +183,7 @@ pub struct Constraints {
     constraints: HashMap<String, VariableInfo>,
 }
 
-type VariableInfo = (
+pub type VariableInfo = (
     // I assume variable rights cannot be changed.
     Arc<Mutex<VariableRight>>,
     Arc<(Mutex<Constraint>, Condvar)>,
@@ -50,7 +192,8 @@ type VariableInfo = (
 /*
   Remaining variable rights.
 */
-enum VariableRight {
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub enum VariableRight {
     All,
     Askable,
     Tellable,
@@ -495,7 +638,7 @@ enum AskTermOp {
 impl AskTermOp {
     fn test(&self, a: &Atom, b: &Atom) -> bool {
         if let AskTermOp::AEqualB = self {
-            a == b
+            Atom::eq(a, b)
         } else {
             if let Atom::Number(a_number) = a {
                 if let Atom::Number(b_number) = b {
@@ -559,9 +702,10 @@ mod tests {
     use crate::{
         call, create_ask_agent, create_ask_term, create_call_agent, create_linear_agent,
         create_tell_agent,
-        expressions::expressions::{Expression, Expressions},
+        expressions::expressions::{Expression, ExpressionCompoundArg, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
-        AskTermOp, Atom, Behavior, BehaviorParam, CallArgument, Constraint, ExecuteEnvironment,
+        AskTerm, AskTermOp, AskTermVec, Atom, Behavior, BehaviorParam, CallArgument, CompoundArg,
+        Constraint, ExecuteEnvironment,
     };
 
     #[test]
@@ -783,6 +927,132 @@ mod tests {
         if let Ok(Constraint::EqualTo(Atom::Number(s))) = env.key_store.get_constraint(&"X".into())
         {
             assert_eq!(s, 3.into());
+        } else {
+            assert!(false);
+        };
+    }
+
+    #[test]
+    fn compound() {
+        /*
+        Question
+        - ?X=comp(atom)->O=ok, X=comp(Y), Y=atom.
+        */
+
+        let question = create_linear_agent(vec![
+            create_ask_agent(
+                Box::new(AskTermVec {
+                    first: Expressions {
+                        exprs: vec![Expression::Variable("X".to_string())],
+                    },
+                    remain: vec![(
+                        AskTermOp::AEqualB,
+                        Expressions {
+                            exprs: vec![Expression::Atom(Atom::Compound(
+                                "comp".to_string(),
+                                vec![CompoundArg::Atom(Atom::Atom("atom".to_string()))],
+                            ))],
+                        },
+                    )],
+                }),
+                create_tell_agent(
+                    "O".to_string(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("ok".to_string()))],
+                    },
+                ),
+            ),
+            create_tell_agent(
+                "X".to_string(),
+                Expressions {
+                    exprs: vec![Expression::Compound(
+                        "comp".to_string(),
+                        vec![ExpressionCompoundArg::Variable("Y".to_string())],
+                    )],
+                },
+            ),
+            create_tell_agent(
+                "Y".to_string(),
+                Expressions {
+                    exprs: vec![Expression::Atom(Atom::Atom("atom".to_string()))],
+                },
+            ),
+        ]);
+
+        let binding = HashMap::new();
+        let env = ExecuteEnvironment::new(&binding, question.variables().into_iter());
+
+        let call_result = question.solve(&env);
+
+        if let Err(_) = call_result {
+            assert!(false);
+        }
+
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"O".into()) {
+            assert_eq!(s, "ok");
+        } else {
+            assert!(false);
+        };
+    }
+
+    #[test]
+    fn compound_aborting() {
+        /*
+        Question
+        - ?X=Y->O=ok, X=a(K), Y=a(K).
+        */
+
+        let question = create_linear_agent(vec![
+            create_ask_agent(
+                Box::new(AskTermVec {
+                    first: Expressions {
+                        exprs: vec![Expression::Variable("X".to_string())],
+                    },
+                    remain: vec![(
+                        AskTermOp::AEqualB,
+                        Expressions {
+                            exprs: vec![Expression::Variable("Y".to_string())],
+                        },
+                    )],
+                }),
+                create_tell_agent(
+                    "O".to_string(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("ok".to_string()))],
+                    },
+                ),
+            ),
+            create_tell_agent(
+                "X".to_string(),
+                Expressions {
+                    exprs: vec![Expression::Compound(
+                        "comp".to_string(),
+                        vec![ExpressionCompoundArg::Variable("K".to_string())],
+                    )],
+                },
+            ),
+            create_tell_agent(
+                "Y".to_string(),
+                Expressions {
+                    exprs: vec![Expression::Compound(
+                        "comp".to_string(),
+                        vec![ExpressionCompoundArg::Variable("K".to_string())],
+                    )],
+                },
+            ),
+        ]);
+
+        let binding = HashMap::new();
+        let env = ExecuteEnvironment::new(&binding, question.variables().into_iter());
+
+        let call_result = question.solve(&env);
+
+        if let Err(_) = call_result {
+            assert!(false);
+        }
+
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"O".into()) {
+            assert_eq!(s, "ok");
         } else {
             assert!(false);
         };
