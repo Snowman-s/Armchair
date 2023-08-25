@@ -705,7 +705,7 @@ pub mod parser {
         }
         #[test]
         fn lexer_two_term_expression_test() {
-            match parse_ask_agent("10 / 6 + A - B * 3 = 20 -> a()") {
+            match parse_ask_agent("10 / 6 + A - B * 3 = 20 -> a().") {
                 Err(_) => assert!(false),
                 Ok((_, agent_enum)) => {
                     if let LexerAgent::AskAgent(agent) = agent_enum {
@@ -760,8 +760,10 @@ pub mod parser {
 
         #[test]
         fn lexer_long_ask_term_test() {
-            match parse_ask_agent("10 = 20 >= A <= B > A < C -> a()") {
-                Err(_) => assert!(false),
+            match parse_ask_agent("10 = 20 >= A <= B > A < C -> a().") {
+                Err(_) => {
+                    assert!(false);
+                }
                 Ok((_, agent_enum)) => {
                     if let LexerAgent::AskAgent(agent) = agent_enum {
                         assert_eq!(

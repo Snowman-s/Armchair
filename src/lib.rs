@@ -109,18 +109,28 @@ impl CompoundArg {
             }
         }
 
-        let func = |arg: CompoundArg| match arg {
+        let func = |arg: &CompoundArg| match arg {
             CompoundArg::Atom(a_atom) => Some(a_atom.clone()),
             CompoundArg::Variable((a_right, a_variable)) => {
-                if VariableRight::Askable != *a_right.lock().unwrap() {
-                    return None;
+                {
+                    let a_right_cloned = a_right.clone();
+                    let a_right_unlocked = a_right_cloned.lock().unwrap();
+
+                    match *a_right_unlocked {
+                        VariableRight::All | VariableRight::Askable => {}
+                        _ => {
+                            return None;
+                        }
+                    }
                 }
 
-                let (cons, cond) = &*a_variable;
+                let a_variable_cloned = a_variable.clone();
+                let (cons, cond) = &*a_variable_cloned;
                 let mut cons_locked = cons.lock().unwrap();
                 loop {
-                    if let Constraint::EqualTo(atom) = cons_locked.clone() {
-                        break Some(atom.clone());
+                    if let Constraint::EqualTo(_) = *cons_locked {
+                        let Constraint::EqualTo(atom) = cons_locked.clone() else { panic!() };
+                        break Some(atom);
                     }
 
                     cons_locked = cond.wait(cons_locked).unwrap();
@@ -128,11 +138,11 @@ impl CompoundArg {
             }
         };
 
-        let a_expr: Option<Atom> = (func)(a.clone());
+        let a_expr: Option<Atom> = (func)(a);
         if let None = a_expr {
             return None;
         }
-        let b_expr: Option<Atom> = (func)(b.clone());
+        let b_expr: Option<Atom> = (func)(b);
         if let None = b_expr {
             return None;
         }
@@ -704,8 +714,8 @@ mod tests {
         create_tell_agent,
         expressions::expressions::{Expression, ExpressionCompoundArg, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
-        AskTerm, AskTermOp, AskTermVec, Atom, Behavior, BehaviorParam, CallArgument, CompoundArg,
-        Constraint, ExecuteEnvironment,
+        AskTermOp, AskTermVec, Atom, Behavior, BehaviorParam, CallArgument, Constraint,
+        ExecuteEnvironment,
     };
 
     #[test]
@@ -948,10 +958,13 @@ mod tests {
                     remain: vec![(
                         AskTermOp::AEqualB,
                         Expressions {
-                            exprs: vec![Expression::Atom(Atom::Compound(
-                                "comp".to_string(),
-                                vec![CompoundArg::Atom(Atom::Atom("atom".to_string()))],
-                            ))],
+                            exprs: vec![
+                                Expression::Atom(Atom::Atom("atom".to_string())),
+                                Expression::Compound(
+                                    "comp".to_string(),
+                                    vec![ExpressionCompoundArg::Expression],
+                                ),
+                            ],
                         },
                     )],
                 }),
