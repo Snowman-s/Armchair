@@ -10,7 +10,11 @@ use std::thread;
 trait AskTerm: Send + Sync {
     fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult;
 
+    /** 呼ぶのに必要な全変数 */
     fn variables(&self) -> HashSet<String>;
+
+    /** 特に上位に伝播する全変数 */
+    fn global_variables(&self) -> HashSet<String>;
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +363,28 @@ impl ExecuteEnvironment<'_> {
         }
     }
 
+    pub fn clone_and_add_variable(&self, variables: &HashSet<String>) -> ExecuteEnvironment {
+        let mut new_constraint = self.key_store.constraints.clone();
+        for variable in variables {
+            if !new_constraint.contains_key(variable) {
+                new_constraint.insert(
+                    variable.to_string(),
+                    (
+                        Arc::new(Mutex::new(VariableRight::None)),
+                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                    ),
+                );
+            }
+        }
+
+        ExecuteEnvironment {
+            behaviors: self.behaviors,
+            key_store: Constraints {
+                constraints: new_constraint,
+            },
+        }
+    }
+
     pub fn key_store(&self) -> &Constraints {
         &self.key_store
     }
@@ -423,7 +449,13 @@ impl BehaviorParam {
 
 pub trait Agent: Send + Sync {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()>;
+    // このエージェントを呼ぶのに必要とする変数
     fn variables(&self) -> HashSet<String>;
+
+    // 上層に伝播させる必要変数 (Askエージェントのみが使用する。残りはローカル変数。)
+    fn global_variables(&self) -> HashSet<String> {
+        self.variables()
+    }
 }
 
 fn call(
@@ -575,7 +607,9 @@ impl Agent for LinearAgent {
             for element in &self.children {
                 threads.push(
                     thread::Builder::new()
-                        .spawn_scoped(scope, move || element.solve(environment))
+                        .spawn_scoped(scope, move || {
+                            element.solve(&environment.clone_and_add_variable(&element.variables()))
+                        })
                         .unwrap(),
                 );
             }
@@ -594,7 +628,7 @@ impl Agent for LinearAgent {
     fn variables(&self) -> HashSet<String> {
         self.children
             .iter()
-            .flat_map(|child| child.variables())
+            .flat_map(|child| child.global_variables())
             .collect()
     }
 }
@@ -623,6 +657,14 @@ impl Agent for AskAgent {
         let mut ret = self.ask_term.variables();
 
         ret.extend(self.then.variables());
+
+        ret
+    }
+
+    fn global_variables(&self) -> HashSet<String> {
+        let mut ret = self.ask_term.global_variables();
+
+        ret.extend(self.then.global_variables());
 
         ret
     }
@@ -699,9 +741,16 @@ impl AskTerm for AskTermVec {
 
         ret
     }
+
+    fn global_variables(&self) -> HashSet<String> {
+        self.variables()
+    }
 }
 
-fn create_ask_term(first: Expressions, remain: Vec<(AskTermOp, Expressions)>) -> Box<dyn AskTerm> {
+fn create_ask_term_vec(
+    first: Expressions,
+    remain: Vec<(AskTermOp, Expressions)>,
+) -> Box<dyn AskTerm> {
     Box::new(AskTermVec { first, remain })
 }
 
@@ -710,7 +759,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        call, create_ask_agent, create_ask_term, create_call_agent, create_linear_agent,
+        call, create_ask_agent, create_ask_term_vec, create_call_agent, create_linear_agent,
         create_tell_agent,
         expressions::expressions::{Expression, ExpressionCompoundArg, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
@@ -848,7 +897,7 @@ mod tests {
                     param_list: vec![BehaviorParam::Teller("O".into())],
                     root: create_linear_agent(vec![
                         create_ask_agent(
-                            create_ask_term(
+                            create_ask_term_vec(
                                 Expressions {
                                     exprs: vec![Expression::Variable("I".into())],
                                 },

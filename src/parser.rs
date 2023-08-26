@@ -115,7 +115,7 @@ pub mod parser {
 
     impl LexerAskTerm {
         fn compile(&self) -> Box<dyn AskTerm> {
-            create_ask_term(
+            create_ask_term_vec(
                 self.first.compile(),
                 self.remain
                     .iter()
@@ -237,7 +237,7 @@ pub mod parser {
     use num_rational::Rational64;
 
     use crate::{
-        create_ask_term,
+        create_ask_term_vec,
         expressions::expressions::{
             Expression, ExpressionCompoundArg, Expressions, TwoNumberCalcType,
         },
