@@ -820,6 +820,7 @@ enum ExistTerm {
 enum ExistTermCompoundArg {
     Expression(Expressions),
     Variable(String),
+    Term(ExistTerm)
 }
 
 impl ExistTerm {
@@ -829,9 +830,12 @@ impl ExistTerm {
                 .iter()
                 .flat_map(|arg| match arg {
                     ExistTermCompoundArg::Expression(expr) => {
-                        expr.variables().into_iter().collect()
+                        expr.variables().into()
                     },
-                    _=>vec![]
+                    ExistTermCompoundArg::Term(term) =>{
+                      term.global_variables()                      
+                    }
+                    _=>HashSet::new()
                 })
                 .collect(),
         }
@@ -841,17 +845,20 @@ impl ExistTerm {
         match self {
             ExistTerm::Compound(_, vec) => vec
                 .iter()
-                .filter_map(|arg| match arg {
+                .flat_map(|arg| match arg {
                     ExistTermCompoundArg::Variable(v) => {
-                        Some(v.clone())
-                    }
-                    _ => None,
+                        HashSet::from([v.clone()])
+                    },
+                    ExistTermCompoundArg::Term(term) => {
+                      term.local_variables()
+                    },
+                    _ => HashSet::new(),
                 })
                 .collect(),
         }
     }
 
-    /** to と一致するような制約をtellする。 */
+    /** to と一致するような制約を返却。 */
     fn unification(&self, to: &Atom, env: &ExecuteEnvironment) -> ConstraintCheckResult {
         match self {
             ExistTerm::Compound(self_name, self_args) => {
@@ -895,12 +902,27 @@ impl ExistTerm {
 
                       will_tell_args.insert(variable.clone(), to_ref);
                     }
+                    ExistTermCompoundArg::Term(term) => {
+                      let to_solved  = match to_arg {
+                        CompoundArg::Atom(atom) => atom.clone(),
+                        CompoundArg::Variable(variable) => {
+                         let Ok(Constraint::EqualTo(atom)) = variable.wait_until_grounded() else {
+                          return ConstraintCheckResult::CONTRADICTION;
+                         };
+                         atom
+                        }
+                      };
+                      match term.unification(&to_solved, env) {
+                        ConstraintCheckResult::SUCCEED(map) => will_tell_args.extend(map),
+                        ConstraintCheckResult::CONTRADICTION => return ConstraintCheckResult::CONTRADICTION,
+                      };
+                    },
                 }
             }
             ConstraintCheckResult::SUCCEED(will_tell_args)
         }
     }
-}
+  }
 }
 
 #[cfg(test)]
@@ -1273,18 +1295,23 @@ mod tests {
     fn compound_exists() {
         /*
         Question
-        - ?comp(E, 2):=X->E=1->O=ok, X=comp(1, 2).
+        - ?comp(comp2(E, 2), 3):=X->E=1->O=ok, X=comp(comp(1, 2), 3).
         */
 
         let question = create_linear_agent(vec![
             create_ask_agent(
                 Box::new(AskTermExists { 
-                  expr: Expressions { exprs:vec![ Expression::Variable("X".to_string())] }, 
                   exis_term: ExistTerm::Compound("comp".to_string(),
                     vec![
-                      ExistTermCompoundArg::Variable("E".to_string()), 
-                      ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(2.into()))] })
-                    ]) 
+                      ExistTermCompoundArg::Term(
+                        ExistTerm::Compound("comp2".to_string(), vec![
+                          ExistTermCompoundArg::Variable("E".to_string()),                           
+                          ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(2.into()))] })
+                          ])
+                      ),
+                      ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(3.into()))] })
+                    ]) ,
+                  expr: Expressions { exprs:vec![ Expression::Variable("X".to_string())] }
                 }),
                 create_ask_agent(
                   Box::new(AskTermVec { 
@@ -1303,12 +1330,17 @@ mod tests {
                 "X".to_string(),
                 Expressions {
                     exprs: vec![
+                      Expression::Atom(Atom::Number(3.into())),
                       Expression::Atom(Atom::Number(2.into())),
                       Expression::Atom(Atom::Number(1.into())),
                       Expression::Compound(
+                        "comp2".to_string(),
+                        vec![ExpressionCompoundArg::Expression, ExpressionCompoundArg::Expression],
+                      ),
+                      Expression::Compound(
                         "comp".to_string(),
                         vec![ExpressionCompoundArg::Expression, ExpressionCompoundArg::Expression],
-                    )],
+                      )],
                 },
             ),
         ]);
