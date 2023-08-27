@@ -10,11 +10,11 @@ use std::thread;
 trait AskTerm: Send + Sync {
     fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult;
 
-    /** 呼ぶのに必要な全変数 */
-    fn variables(&self) -> HashSet<String>;
-
-    /** 特に上位に伝播する全変数 */
+    /** 上位に伝播する変数 */
     fn global_variables(&self) -> HashSet<String>;
+
+    /** 上位に伝播しない変数 */
+    fn local_variables(&self) -> HashSet<String>;
 }
 
 #[derive(Clone, Debug)]
@@ -87,7 +87,7 @@ impl Atom {
 #[derive(Clone, Debug)]
 pub enum CompoundArg {
     Atom(Atom),
-    Variable(VariableInfo),
+    Variable(VariableRef),
 }
 
 impl CompoundArg {
@@ -98,49 +98,26 @@ impl CompoundArg {
         a: &'a CompoundArg,
         b: &'a CompoundArg,
     ) -> Option<Vec<(Atom, Atom)>> {
-        if let CompoundArg::Variable((a_right, a_variable)) = a {
-            if let CompoundArg::Variable((b_right, b_variable)) = b {
+        if let CompoundArg::Variable(a_ref) = a {
+            if let CompoundArg::Variable(b_ref) = b {
                 // どちらも変数の場合の処理
-                if !(Arc::ptr_eq(&a_right, &b_right)
-                    || *a_right.lock().unwrap() == *b_right.lock().unwrap())
-                {
-                    return None;
-                }
-
-                if Arc::ptr_eq(&a_variable, &b_variable) {
-                    return Some(vec![]);
+              match VariableRef::same_check(a_ref, b_ref) {
+                VariableRefSameCheckResult::Equal => return Some(vec![]),
+                VariableRefSameCheckResult::CanBeEqual => {},
+                VariableRefSameCheckResult::Different => return None,
+            }
                 }
             }
-        }
+        
 
         let func = |arg: &CompoundArg| match arg {
             CompoundArg::Atom(a_atom) => Some(a_atom.clone()),
-            CompoundArg::Variable((a_right, a_variable)) => {
-                {
-                    let a_right_cloned = a_right.clone();
-                    let a_right_unlocked = a_right_cloned.lock().unwrap();
-
-                    match *a_right_unlocked {
-                        VariableRight::All | VariableRight::Askable => {}
-                        _ => {
-                            return None;
-                        }
-                    }
-                }
-
-                let a_variable_cloned = a_variable.clone();
-                let (cons, cond) = &*a_variable_cloned;
-                let mut cons_locked = cons.lock().unwrap();
-                loop {
-                    if let Constraint::EqualTo(_) = *cons_locked {
-                        let Constraint::EqualTo(atom) = cons_locked.clone() else { panic!() };
-                        break Some(atom);
-                    }
-
-                    cons_locked = cond.wait(cons_locked).unwrap();
-                }
-            }
-        };
+            CompoundArg::Variable(v_ref) => {
+              let Ok(Constraint::EqualTo(atom)) =     v_ref.wait_until_grounded() else {return None};
+            
+              Some(atom.clone())
+        }
+      };
 
         let a_expr: Option<Atom> = (func)(a);
         if let None = a_expr {
@@ -167,11 +144,11 @@ impl ToString for Atom {
                     .map(|(idx, arg)| {
                         let target = match arg {
                             CompoundArg::Atom(atom) => atom.to_string(),
-                            CompoundArg::Variable((right, cons_arc)) => {
-                                if let VariableRight::Tellable = *right.lock().unwrap() {
+                            CompoundArg::Variable(v_ref) => {
+                                if let VariableRight::Tellable = *v_ref.right.lock().unwrap() {
                                     "!".to_string()
                                 } else {
-                                    match cons_arc.0.lock().unwrap().clone() {
+                                    match v_ref.cons.0.lock().unwrap().clone() {
                                         Constraint::EqualTo(atom) => atom.to_string(),
                                         Constraint::None => "*".to_string(),
                                     }
@@ -194,14 +171,121 @@ impl ToString for Atom {
 
 pub struct Constraints {
     /** 変数名:制約*/
-    constraints: HashMap<String, VariableInfo>,
+    constraints: HashMap<String, VariableRef>,
 }
 
-pub type VariableInfo = (
-    // I assume variable rights cannot be changed.
-    Arc<Mutex<VariableRight>>,
-    Arc<(Mutex<Constraint>, Condvar)>,
-);
+#[derive(Clone, Debug)]
+pub struct VariableRef {
+  right: Arc<Mutex<VariableRight>>,
+  cons: Arc<(Mutex<Constraint>, Condvar)>,
+}
+
+impl VariableRef {
+  fn tell(&self, told: Constraint) -> Result<(), ()> {
+    let took_cons = self.get_tell_rights()?;
+
+    let (original_cons, condvar) = &*took_cons.cons;
+    *original_cons.lock().unwrap() = told;
+
+    condvar.notify_all();
+
+    Ok(())
+  }
+
+  /** 
+ Err, if variable doesn't have ask-rights.
+*/
+fn get_constraint(&self) -> Result<Constraint, ()> {
+  let took_ref = self.get_ask_rights()?;
+
+  let (arc_constraints, _) = &*took_ref.cons;
+
+  return Ok(arc_constraints.lock().unwrap().clone());
+}
+
+/** Wait until the variable's constraint is not None.
+ Err, if variable doesn't have ask-rights.
+*/
+fn wait_until_grounded(&self) -> Result<Constraint, ()> {
+    let took_ref = self.get_ask_rights()?;
+
+    let (arc_constraints, condvar) = &*took_ref.cons;
+
+    let mut the_constraint = arc_constraints.lock().unwrap();
+    loop {
+        if let Constraint::EqualTo(_) = *the_constraint {
+            return Ok(the_constraint.clone());
+        }
+
+        the_constraint = condvar.wait(the_constraint).unwrap();
+    }
+}
+
+fn took_ref(&self, right:VariableRight) -> VariableRef{
+  VariableRef { right: Arc::new(Mutex::new(right)), cons: self.cons.clone()}
+}
+
+/**  private function
+  - \<UnInitilized> | AskRight -> Set Tell-Right to self. Return (Ask-Right, data)
+  - Others -> Return Err.
+*/
+fn get_ask_rights(&self) -> Result<VariableRef, ()> {
+            let right_guard = self.right.lock().unwrap();
+            match *right_guard {
+                VariableRight::All | VariableRight::Askable => {
+                    return Ok(self.took_ref(VariableRight::Askable));
+                }
+                _ => {
+                    return Err(());
+                }
+            };
+    }
+
+
+/**  private function
+  - \<UnInitilized> | AskRight -> Return (Ask-Right, data)
+  - TellRight -> Set None-Right to self. Return (Tell-Right, data).
+  - NoneRight -> Err(())
+*/
+fn get_ask_argument_rights(&self) -> Result<VariableRef, ()> {
+            let mut right_guard = self.right.lock().unwrap();
+            match *right_guard {
+                VariableRight::All | VariableRight::Askable => {
+                    return Ok(self.took_ref(VariableRight::Askable));
+                }
+                VariableRight::Tellable => {
+                    *right_guard = VariableRight::None;
+                    return Ok(self.took_ref(VariableRight::Tellable));
+                }
+                VariableRight::None => return Err(()),
+            };
+}
+
+  /**  private function
+    - \<UnInitilized> -> Set Ask-Right to self. Return (Tell-Right, data)
+    - TellRight -> Return (Tell-Right, data).
+    - Others -> Return Err.
+  */
+  fn get_tell_rights(&self) -> Result<VariableRef, ()> {
+      let mut right_guard = self.right.lock().unwrap();
+      match *right_guard {
+          VariableRight::All => *right_guard = VariableRight::Askable,
+          VariableRight::Tellable => *right_guard = VariableRight::None,
+          _ => {
+              return Err(());
+          }
+      };
+      return Ok(self.took_ref(VariableRight::Tellable));
+  }
+
+  fn same_check(a_ref: &VariableRef,b_ref:&VariableRef) -> VariableRefSameCheckResult {
+    if Arc::ptr_eq(&a_ref.cons, &b_ref.cons) {
+    VariableRefSameCheckResult::Equal
+} else {
+  VariableRefSameCheckResult::CanBeEqual
+}
+  }
+}
 
 /*
   Remaining variable rights.
@@ -214,6 +298,12 @@ pub enum VariableRight {
     None,
 }
 
+pub enum VariableRefSameCheckResult {
+  Equal,
+  CanBeEqual,
+  Different
+}
+
 impl Constraints {
     pub fn new(variables: impl Iterator<Item = String>) -> Constraints {
         Constraints {
@@ -221,77 +311,46 @@ impl Constraints {
                 .map(|variable_id| {
                     (
                         variable_id,
-                        (
-                            Arc::new(Mutex::new(VariableRight::All)),
-                            Arc::new((Mutex::new(Constraint::None), Condvar::new())),
-                        ),
+                        VariableRef {
+                           right: Arc::new(Mutex::new(VariableRight::All)),
+                           cons: Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                        },
                     )
                 })
                 .collect(),
         }
     }
 
-    fn tell(&self, variable_id: String, told: Constraint) -> Result<(), ()> {
-        let (_, original_cons_arc) = self.get_tell_rights(&variable_id)?;
-
-        let (original_cons, condvar) = &*original_cons_arc;
-        *original_cons.lock().unwrap() = told;
-
-        condvar.notify_all();
-
-        Ok(())
+    fn tell(&self, variable_id: &String, told: Constraint) -> Result<(), ()> {
+      let v_ref = self.get_tell_rights(variable_id)?;
+        
+      v_ref.tell(told)
     }
 
-    /**
-     * Err, if variable doesn't have ask-rights.
-     */
+/** 
+     Err, if variable doesn't have ask-rights.
+    */
     pub fn get_constraint(&self, variable_id: &String) -> Result<Constraint, ()> {
-        let (_, cons_arc) = self.get_ask_rights(variable_id)?;
-
-        let (cons, _) = &*cons_arc;
-
-        let ret = cons.lock().unwrap().clone();
-
-        Ok(ret)
-    }
+      let v_ref = self.get_ask_rights(variable_id)?;
+      
+      v_ref.get_constraint()
+  }
 
     /** Wait until the variable's constraint is not None.
      Err, if variable doesn't have ask-rights.
     */
     fn wait_until_grounded(&self, variable_id: &String) -> Result<Constraint, ()> {
-        let (_, arc) = self.get_ask_rights(variable_id)?;
-
-        let (arc_constraints, condvar) = &*arc;
-
-        let mut the_constraint = arc_constraints.lock().unwrap();
-        loop {
-            if let Constraint::EqualTo(_) = *the_constraint {
-                return Ok(the_constraint.clone());
-            }
-
-            the_constraint = condvar.wait(the_constraint).unwrap();
-        }
+        let v_ref = self.get_ask_rights(variable_id)?;
+        
+        v_ref.wait_until_grounded()
     }
 
     /**  private function
       - \<UnInitilized> | AskRight -> Set Tell-Right to self. Return (Ask-Right, data)
       - Others -> Return Err.
     */
-    fn get_ask_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
-        match self.constraints.get(variable_id) {
-            Some((right, data)) => {
-                let right_guard = right.lock().unwrap();
-                match *right_guard {
-                    VariableRight::All | VariableRight::Askable => {
-                        return Ok((Arc::new(Mutex::new(VariableRight::Askable)), data.clone()));
-                    }
-                    _ => {
-                        return Err(());
-                    }
-                };
-            }
-            None => Err(()),
-        }
+    fn get_ask_rights(&self, variable_id: &String) -> Result<VariableRef, ()> {
+      self.constraints.get(variable_id).and_then(|v_ref|v_ref.get_ask_rights().ok()).ok_or(())
     }
 
     /**  private function
@@ -299,23 +358,8 @@ impl Constraints {
       - TellRight -> Set None-Right to self. Return (Tell-Right, data).
       - NoneRight -> Err(())
     */
-    fn get_ask_argument_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
-        match self.constraints.get(variable_id) {
-            Some((right, data)) => {
-                let mut right_guard = right.lock().unwrap();
-                match *right_guard {
-                    VariableRight::All | VariableRight::Askable => {
-                        return Ok((Arc::new(Mutex::new(VariableRight::Askable)), data.clone()));
-                    }
-                    VariableRight::Tellable => {
-                        *right_guard = VariableRight::None;
-                        return Ok((Arc::new(Mutex::new(VariableRight::Tellable)), data.clone()));
-                    }
-                    VariableRight::None => return Err(()),
-                };
-            }
-            None => Err(()),
-        }
+    fn get_ask_argument_rights(&self, variable_id: &String) -> Result<VariableRef, ()> {
+      self.constraints.get(variable_id).and_then(|v_ref|v_ref.get_ask_argument_rights().ok()).ok_or(())
     }
 
     /**  private function
@@ -323,27 +367,14 @@ impl Constraints {
       - TellRight -> Return (Tell-Right, data).
       - Others -> Return Err.
     */
-    fn get_tell_rights(&self, variable_id: &String) -> Result<VariableInfo, ()> {
-        match self.constraints.get(variable_id) {
-            Some((right, data)) => {
-                let mut right_guard = right.lock().unwrap();
-                match *right_guard {
-                    VariableRight::All => *right_guard = VariableRight::Askable,
-                    VariableRight::Tellable => *right_guard = VariableRight::None,
-                    _ => {
-                        return Err(());
-                    }
-                };
-                return Ok((Arc::new(Mutex::new(VariableRight::Tellable)), data.clone()));
-            }
-            None => Err(()),
-        }
+    fn get_tell_rights(&self, variable_id: &String) -> Result<VariableRef, ()> {
+        self.constraints.get(variable_id).and_then(|v_ref|v_ref.get_tell_rights().ok()).ok_or(())
     }
 }
 
 enum ConstraintCheckResult {
     /**  constraints の一部を返す*/
-    SUCCEED,
+    SUCCEED(HashMap<String, VariableRef>),
     CONTRADICTION,
 }
 
@@ -363,16 +394,13 @@ impl ExecuteEnvironment<'_> {
         }
     }
 
-    pub fn clone_and_add_variable(&self, variables: &HashSet<String>) -> ExecuteEnvironment {
+    pub fn clone_and_add_variable(&self, variables: HashMap<String, VariableRef>) -> ExecuteEnvironment {
         let mut new_constraint = self.key_store.constraints.clone();
-        for variable in variables {
-            if !new_constraint.contains_key(variable) {
+        for (id, v_ref) in variables {
+            if !new_constraint.contains_key(&id) {
                 new_constraint.insert(
-                    variable.to_string(),
-                    (
-                        Arc::new(Mutex::new(VariableRight::None)),
-                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
-                    ),
+                    id,
+                    v_ref,
                 );
             }
         }
@@ -414,10 +442,10 @@ impl ExecuteEnvironment<'_> {
             if !new_constraints.contains_key(&init) {
                 new_constraints.insert(
                     init.clone(),
-                    (
-                        Arc::new(Mutex::new(VariableRight::All)),
-                        Arc::new((Mutex::new(Constraint::None), Condvar::new())),
-                    ),
+                    VariableRef {
+                       right: Arc::new(Mutex::new(VariableRight::All)),
+                       cons: Arc::new((Mutex::new(Constraint::None), Condvar::new())),
+                    },
                 );
             }
         }
@@ -488,7 +516,7 @@ impl Agent for TellAgent {
 
         environment
             .key_store
-            .tell(self.variable_id.clone(), Constraint::EqualTo(expr_solved))
+            .tell(&self.variable_id, Constraint::EqualTo(expr_solved))
     }
 
     fn variables(&self) -> HashSet<String> {
@@ -536,7 +564,7 @@ impl CallArgument {
     fn apply_to_new_constraint(
         &self,
         now_env: &ExecuteEnvironment,
-        creating_cons: &mut HashMap<String, VariableInfo>,
+        creating_cons: &mut HashMap<String, VariableRef>,
         param: &BehaviorParam,
     ) -> Result<(), ()> {
         match self {
@@ -555,10 +583,10 @@ impl CallArgument {
 
                 creating_cons.insert(
                     param.get_variable_name().clone(),
-                    (
-                        Arc::new(Mutex::new(VariableRight::Askable)),
-                        Arc::new((Mutex::new(Constraint::EqualTo(expr_solved)), Condvar::new())),
-                    ),
+                    VariableRef {
+                     right:   Arc::new(Mutex::new(VariableRight::Askable)),
+                      cons:  Arc::new((Mutex::new(Constraint::EqualTo(expr_solved)), Condvar::new())),
+                    },
                 );
                 Ok(())
             }
@@ -607,9 +635,7 @@ impl Agent for LinearAgent {
             for element in &self.children {
                 threads.push(
                     thread::Builder::new()
-                        .spawn_scoped(scope, move || {
-                            element.solve(&environment.clone_and_add_variable(&element.variables()))
-                        })
+                        .spawn_scoped(scope, move || {element.solve(environment)})
                         .unwrap(),
                 );
             }
@@ -644,27 +670,34 @@ struct AskAgent {
 
 impl Agent for AskAgent {
     fn solve(&self, environment: &ExecuteEnvironment) -> Result<(), ()> {
-        let check_res = &self.ask_term.prove(&environment);
+        let check_res = self.ask_term.prove(&environment);
 
-        if let ConstraintCheckResult::CONTRADICTION = check_res {
-            Ok(())
-        } else {
-            self.then.solve(environment)
+        match check_res {
+            ConstraintCheckResult::SUCCEED(map) => {
+              let new_environment = environment.clone_and_add_variable(map);
+
+              self.then.solve(&new_environment)
+            },
+            ConstraintCheckResult::CONTRADICTION => Ok(()),
         }
     }
 
     fn variables(&self) -> HashSet<String> {
-        let mut ret = self.ask_term.variables();
+        let mut ret = self.ask_term.global_variables();
 
+        ret.extend(self.ask_term.local_variables());
         ret.extend(self.then.variables());
 
         ret
     }
 
     fn global_variables(&self) -> HashSet<String> {
-        let mut ret = self.ask_term.global_variables();
+        let mut ret = self.then.global_variables();
+        ret.extend(self.ask_term.global_variables());
 
-        ret.extend(self.then.global_variables());
+        for local in self.ask_term.local_variables(){
+          ret.remove(&local);
+        }
 
         ret
     }
@@ -730,10 +763,10 @@ impl AskTerm for AskTermVec {
             expr_cache = expr_solved;
         }
 
-        ConstraintCheckResult::SUCCEED
+        ConstraintCheckResult::SUCCEED(HashMap::new())
     }
 
-    fn variables(&self) -> HashSet<String> {
+    fn global_variables(&self) -> HashSet<String> {
         let mut ret = HashSet::from(self.first.variables());
         for (_, expr) in &self.remain {
             ret.extend(expr.variables());
@@ -742,8 +775,8 @@ impl AskTerm for AskTermVec {
         ret
     }
 
-    fn global_variables(&self) -> HashSet<String> {
-        self.variables()
+    fn local_variables(&self) -> HashSet<String> {
+        HashSet::new()
     }
 }
 
@@ -752,6 +785,122 @@ fn create_ask_term_vec(
     remain: Vec<(AskTermOp, Expressions)>,
 ) -> Box<dyn AskTerm> {
     Box::new(AskTermVec { first, remain })
+}
+
+struct AskTermExists {
+    expr: Expressions,
+    exis_term: ExistTerm,
+}
+
+impl AskTerm for AskTermExists {
+    fn prove(&self, constraints: &ExecuteEnvironment) -> ConstraintCheckResult {
+        let solved_result = self.expr.solve(constraints);
+
+        match solved_result {
+            Ok(solved) => self.exis_term.unification(&solved, constraints),
+            Err(()) => ConstraintCheckResult::CONTRADICTION,
+        }
+    }
+
+    fn global_variables(&self) -> HashSet<String> {
+        let mut ret = self.expr.variables();
+        ret.extend(self.exis_term.global_variables());
+
+        ret
+    }
+
+    fn local_variables(&self) -> HashSet<String> {
+        self.exis_term.local_variables()
+    }
+}
+
+enum ExistTerm {
+    Compound(String, Vec<ExistTermCompoundArg>),
+}
+enum ExistTermCompoundArg {
+    Expression(Expressions),
+    Variable(String),
+}
+
+impl ExistTerm {
+    fn global_variables(&self) -> HashSet<String> {
+        match self {
+            ExistTerm::Compound(_, vec) => vec
+                .iter()
+                .flat_map(|arg| match arg {
+                    ExistTermCompoundArg::Expression(expr) => {
+                        expr.variables().into_iter().collect()
+                    },
+                    _=>vec![]
+                })
+                .collect(),
+        }
+    }
+
+    fn local_variables(&self) -> HashSet<String> {
+        match self {
+            ExistTerm::Compound(_, vec) => vec
+                .iter()
+                .filter_map(|arg| match arg {
+                    ExistTermCompoundArg::Variable(v) => {
+                        Some(v.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /** to と一致するような制約をtellする。 */
+    fn unification(&self, to: &Atom, env: &ExecuteEnvironment) -> ConstraintCheckResult {
+        match self {
+            ExistTerm::Compound(self_name, self_args) => {
+                let Atom::Compound(to_name, to_args) = 
+                  to else{ return ConstraintCheckResult::CONTRADICTION;};
+
+                if self_name != to_name || self_args.len() != to_args.len(){
+                  return ConstraintCheckResult::CONTRADICTION;
+                }
+
+                let mut will_tell_args = HashMap::new();
+
+                for index in 0..self_args.len(){
+                  let self_arg = &self_args[index];
+                  let to_arg = &to_args[index];
+
+                  match self_arg {
+                    ExistTermCompoundArg::Expression(expr) => {
+                      let Ok(expr_solved) = expr.solve(env) else {
+                        return ConstraintCheckResult::CONTRADICTION
+                      };
+                      let to_solved  = match to_arg {
+                        CompoundArg::Atom(atom) => atom.clone(),
+                        CompoundArg::Variable(variable) => {
+                         let Ok(Constraint::EqualTo(atom)) = variable.wait_until_grounded() else {
+                          return ConstraintCheckResult::CONTRADICTION;
+                         };
+                         atom
+                        }
+                      };
+    
+                      if !Atom::eq(&expr_solved, &to_solved) {
+                        return ConstraintCheckResult::CONTRADICTION;                        
+                      }
+                    },
+                    ExistTermCompoundArg::Variable(variable) => {
+                      let to_ref  = match to_arg {
+                        CompoundArg::Atom(atom) => VariableRef{ right: Arc::new(Mutex::new(VariableRight::All)), cons: Arc::new((Mutex::new(Constraint::EqualTo( atom.clone())), Condvar::new())) },
+                        CompoundArg::Variable(variable) => variable.clone()                        
+                      };
+
+                      will_tell_args.insert(variable.clone(), to_ref);
+                    }
+                }
+            }
+            ConstraintCheckResult::SUCCEED(will_tell_args)
+        }
+    }
+}
 }
 
 #[cfg(test)]
@@ -764,7 +913,7 @@ mod tests {
         expressions::expressions::{Expression, ExpressionCompoundArg, Expressions},
         parser::parser::{compile_one_behavior, ParseResult},
         AskTermOp, AskTermVec, Atom, Behavior, BehaviorParam, CallArgument, Constraint,
-        ExecuteEnvironment,
+        ExecuteEnvironment, AskTermExists, ExistTerm, ExistTermCompoundArg,
     };
 
     #[test]
@@ -1106,6 +1255,66 @@ mod tests {
 
         let binding = HashMap::new();
         let env = ExecuteEnvironment::new(&binding, question.variables().into_iter());
+
+        let call_result = question.solve(&env);
+
+        if let Err(_) = call_result {
+            assert!(false);
+        }
+
+        if let Ok(Constraint::EqualTo(Atom::Atom(s))) = env.key_store.get_constraint(&"O".into()) {
+            assert_eq!(s, "ok");
+        } else {
+            assert!(false);
+        };
+    }
+
+    #[test]
+    fn compound_exists() {
+        /*
+        Question
+        - ?comp(E, 2):=X->E=1->O=ok, X=comp(1, 2).
+        */
+
+        let question = create_linear_agent(vec![
+            create_ask_agent(
+                Box::new(AskTermExists { 
+                  expr: Expressions { exprs:vec![ Expression::Variable("X".to_string())] }, 
+                  exis_term: ExistTerm::Compound("comp".to_string(),
+                    vec![
+                      ExistTermCompoundArg::Variable("E".to_string()), 
+                      ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(2.into()))] })
+                    ]) 
+                }),
+                create_ask_agent(
+                  Box::new(AskTermVec { 
+                    first: Expressions { exprs: vec![Expression::Variable("E".to_string())] }, 
+                    remain: vec![(AskTermOp::AEqualB, Expressions{exprs:vec![Expression::Atom(Atom::Number(1.into()))] })]
+                  }),
+                  create_tell_agent(
+                    "O".to_string(),
+                    Expressions {
+                        exprs: vec![Expression::Atom(Atom::Atom("ok".to_string()))],
+                    },
+                  )
+                ),
+            ),
+            create_tell_agent(
+                "X".to_string(),
+                Expressions {
+                    exprs: vec![
+                      Expression::Atom(Atom::Number(2.into())),
+                      Expression::Atom(Atom::Number(1.into())),
+                      Expression::Compound(
+                        "comp".to_string(),
+                        vec![ExpressionCompoundArg::Expression, ExpressionCompoundArg::Expression],
+                    )],
+                },
+            ),
+        ]);
+
+        let binding = HashMap::new();
+        let env = ExecuteEnvironment::new(&binding, question.global_variables().into_iter());
 
         let call_result = question.solve(&env);
 
