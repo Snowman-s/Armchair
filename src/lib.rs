@@ -436,7 +436,7 @@ impl ExecuteEnvironment<'_> {
 
         for (index, argument) in arguments.iter().enumerate() {
             let p = param.get(index).ok_or(())?;
-            argument.apply_to_new_constraint(self, &mut new_constraints, &param[index])?;
+            argument.apply_to_new_constraint(self, &mut new_constraints, &p)?;
         }
 
         for init in initilize_variables {

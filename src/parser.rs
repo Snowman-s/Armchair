@@ -1,4 +1,6 @@
 pub mod parser {
+    use crate::create_call_agent;
+
     #[derive(Debug, PartialEq, Eq)]
     pub struct LexerBehavior {
         name: String,
@@ -29,13 +31,12 @@ pub mod parser {
     impl LexerAgent {
         fn compile(&self) -> Box<dyn Agent> {
             match self {
-                LexerAgent::TellAgent(lexer) => Box::new(TellAgent {
-                    variable_id: lexer.variable.clone(),
-                    expression: lexer.expression.compile(),
-                }),
-                LexerAgent::CallAgent(lexer) => Box::new(CallAgent {
-                    behavior_name: lexer.behavior_name.clone(),
-                    argument_variables: lexer
+                LexerAgent::TellAgent(lexer) => {
+                    create_tell_agent(lexer.variable.clone(), lexer.expression.compile())
+                }
+                LexerAgent::CallAgent(lexer) => create_call_agent(
+                    lexer.behavior_name.clone(),
+                    lexer
                         .argument_variable_list
                         .iter()
                         .map(|s| match s {
@@ -50,14 +51,13 @@ pub mod parser {
                             }
                         })
                         .collect(),
-                }),
-                LexerAgent::AskAgent(lexer) => Box::new(AskAgent {
-                    ask_term: lexer.ask_term.compile(),
-                    then: lexer.then.compile(),
-                }),
-                LexerAgent::LinearAgent(lexer) => Box::new(LinearAgent {
-                    children: lexer.children.iter().map(|c| c.compile()).collect(),
-                }),
+                ),
+                LexerAgent::AskAgent(lexer) => {
+                    create_ask_agent(lexer.ask_term.compile(), lexer.then.compile())
+                }
+                LexerAgent::LinearAgent(lexer) => {
+                    create_linear_agent(lexer.children.iter().map(|c| c.compile()).collect())
+                }
             }
         }
     }
@@ -304,12 +304,13 @@ pub mod parser {
     use num_rational::Rational64;
 
     use crate::{
-        create_ask_term_exists, create_ask_term_vec,
+        create_ask_agent, create_ask_term_exists, create_ask_term_vec, create_linear_agent,
+        create_tell_agent,
         expressions::expressions::{
             Expression, ExpressionCompoundArg, Expressions, TwoNumberCalcType,
         },
-        Agent, AskAgent, AskTerm, AskTermOp, Atom, Behavior, BehaviorParam, CallAgent,
-        CallArgument, ExistTerm, ExistTermCompoundArg, LinearAgent, TellAgent,
+        Agent, AskTerm, AskTermOp, Atom, Behavior, BehaviorParam, CallArgument, ExistTerm,
+        ExistTermCompoundArg,
     };
 
     type Res<'a, T> = IResult<&'a str, T>;

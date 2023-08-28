@@ -3,7 +3,7 @@ pub mod executors {
 
     use crate::{
         parser::parser::{compile_one_behavior, CompileError, ParseResult},
-        Atom, Behavior, Constraint, ExecuteEnvironment,
+        Behavior, Constraint, ExecuteEnvironment,
     };
 
     pub fn execute(code: &str) -> Result<Vec<HashMap<String, Constraint>>, String> {
