@@ -464,6 +464,7 @@ pub mod parser {
                 parse_until_non_symbol,
                 multispace0,
                 char('('),
+                multispace0,
                 separated_list0(
                     tuple((multispace0, char(','), multispace0)),
                     parse_call_argument,
@@ -471,7 +472,7 @@ pub mod parser {
                 multispace0,
                 char(')'),
             )),
-            |(behavior_name, _, _, exp, _, _)| {
+            |(behavior_name, _, _, _, exp, _, _)| {
                 LexerAgent::CallAgent(LexerCallAgent {
                     behavior_name: behavior_name.into(),
                     argument_variable_list: exp,
@@ -623,7 +624,10 @@ pub mod parser {
 
     fn parse_until_non_symbol(code: &str) -> Res<&str> {
         recognize(take_while(|s: char| {
-            ![',', '(', ')', '\'', ' ', '　', ':', '-', '>', '.', '='].contains(&s)
+            ![
+                ',', '(', ')', '\'', ' ', '　', ':', '-', '>', '.', '=', '+', '-', '*', '/', '%',
+            ]
+            .contains(&s)
         }))(code)
     }
 
