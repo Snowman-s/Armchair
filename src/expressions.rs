@@ -29,7 +29,8 @@ pub mod expressions {
                         .iter()
                         .filter_map(|s| match s {
                             ExpressionCompoundArg::Expression => None,
-                            ExpressionCompoundArg::Variable(v) => Some(v.clone()),
+                            ExpressionCompoundArg::AskerVariable(v) => Some(v.clone()),
+                            ExpressionCompoundArg::TellerVariable(v) => Some(v.clone()),
                         })
                         .collect(),
                     _ => vec![],
@@ -47,7 +48,8 @@ pub mod expressions {
 
     pub enum ExpressionCompoundArg {
         Expression,
-        Variable(String),
+        AskerVariable(String),
+        TellerVariable(String),
     }
 
     impl Expression {
@@ -72,8 +74,23 @@ pub mod expressions {
                                 let pop = stack.pop_front().ok_or(())?;
                                 comp_arg.push(CompoundArg::Atom(pop));
                             }
-                            ExpressionCompoundArg::Variable(variable) => {
-                                let v_info = env.key_store.constraints.get(variable).ok_or(())?;
+                            ExpressionCompoundArg::AskerVariable(variable) => {
+                                let v_info = env
+                                    .key_store
+                                    .constraints
+                                    .get(variable)
+                                    .and_then(|v_ref| v_ref.get_ask_argument_rights().ok())
+                                    .ok_or(())?;
+
+                                comp_arg.push(CompoundArg::Variable(v_info.clone()));
+                            }
+                            ExpressionCompoundArg::TellerVariable(variable) => {
+                                let v_info = env
+                                    .key_store
+                                    .constraints
+                                    .get(variable)
+                                    .and_then(|v_ref| v_ref.get_tell_rights().ok())
+                                    .ok_or(())?;
 
                                 comp_arg.push(CompoundArg::Variable(v_info.clone()));
                             }

@@ -154,7 +154,8 @@ pub mod parser {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum LexerExisTerm {
-        Variable(String),
+        TellerVariable(String),
+        AskerVariable(String),
         Compound(String, Vec<LexerExistCompoundArg>),
     }
 
@@ -167,7 +168,8 @@ pub mod parser {
     impl LexerExisTerm {
         fn compile(&self) -> ExistTerm {
             match self {
-                LexerExisTerm::Variable(v) => ExistTerm::Variable(v.clone()),
+                LexerExisTerm::AskerVariable(v) => ExistTerm::AskerVariable(v.clone()),
+                LexerExisTerm::TellerVariable(v) => ExistTerm::TellerVariable(v.clone()),
                 LexerExisTerm::Compound(name, args) => ExistTerm::Compound(
                     name.to_string(),
                     args.iter()
@@ -204,7 +206,8 @@ pub mod parser {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum LexerCompoundArgument {
-        Variable(String),
+        AskerVariable(String),
+        TellerVariable(String),
         Other(Box<LexerExpressions>),
     }
 
@@ -228,7 +231,8 @@ pub mod parser {
 
                     for arg in args.iter().rev() {
                         match arg {
-                            LexerCompoundArgument::Variable(_) => {}
+                            LexerCompoundArgument::AskerVariable(_) => {}
+                            LexerCompoundArgument::TellerVariable(_) => {}
                             LexerCompoundArgument::Other(expr) => compiled.extend(expr.to_vec()),
                         }
                     }
@@ -237,8 +241,11 @@ pub mod parser {
                         name.to_string(),
                         args.into_iter()
                             .map(|a| match a {
-                                LexerCompoundArgument::Variable(v) => {
-                                    ExpressionCompoundArg::Variable(v.to_string())
+                                LexerCompoundArgument::AskerVariable(v) => {
+                                    ExpressionCompoundArg::AskerVariable(v.to_string())
+                                }
+                                LexerCompoundArgument::TellerVariable(v) => {
+                                    ExpressionCompoundArg::TellerVariable(v.to_string())
                                 }
                                 LexerCompoundArgument::Other(_) => {
                                     ExpressionCompoundArg::Expression
@@ -582,8 +589,15 @@ pub mod parser {
                 )),
                 |(name, _, _, _, vec, _)| LexerExisTerm::Compound(name.to_string(), vec),
             ),
-            // 変数
-            map(parse_variable, |v| LexerExisTerm::Variable(v.to_string())),
+            // Asker変数
+            map(parse_variable, |v| {
+                LexerExisTerm::AskerVariable(v.to_string())
+            }),
+            // Teller変数
+            map(
+                tuple((char('!'), multispace0, parse_variable)),
+                |(_, _, v)| LexerExisTerm::TellerVariable(v.to_string()),
+            ),
         ))(code)
     }
 
@@ -717,10 +731,19 @@ pub mod parser {
                         alt((
                             map(
                                 tuple((
+                                    char('!'),
+                                    multispace0,
                                     parse_variable,
                                     peek(tuple((multispace0, alt((char(','), char(')')))))),
                                 )),
-                                |(v, _)| LexerCompoundArgument::Variable(v.to_string()),
+                                |(_, _, v, _)| LexerCompoundArgument::TellerVariable(v.to_string()),
+                            ),
+                            map(
+                                tuple((
+                                    parse_variable,
+                                    peek(tuple((multispace0, alt((char(','), char(')')))))),
+                                )),
+                                |(v, _)| LexerCompoundArgument::AskerVariable(v.to_string()),
                             ),
                             map(parse_expressions, |v| {
                                 LexerCompoundArgument::Other(Box::new(v))
@@ -914,7 +937,7 @@ pub mod parser {
                                     LexerCompoundArgument::Other(Box::new(
                                         LexerExpressions::Variable("A".to_string())
                                     )),
-                                    LexerCompoundArgument::Variable("V".to_string())
+                                    LexerCompoundArgument::AskerVariable("V".to_string())
                                 ]
                             )
                         }

@@ -3,7 +3,6 @@ pub mod parser;
 
 use expressions::expressions::Expressions;
 use num_rational::Rational64;
-use parser::parser::LexerExpressions;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -816,7 +815,8 @@ impl AskTerm for AskTermExists {
 }
 
 enum ExistTerm {
-    Variable(String),
+    AskerVariable(String),
+    TellerVariable(String),
     Compound(String, Vec<ExistTermCompoundArg>),
 }
 enum ExistTermCompoundArg {
@@ -852,7 +852,8 @@ impl VariableRefOrAtom {
 impl ExistTerm {
     fn global_variables(&self) -> HashSet<String> {
         match self {
-            ExistTerm::Variable(_)=>{HashSet::new()},
+            ExistTerm::AskerVariable(_)=>{HashSet::new()},
+            ExistTerm::TellerVariable(_)=>{HashSet::new()},
             ExistTerm::Compound(_, vec) => vec
                 .iter()
                 .flat_map(|arg| match arg {
@@ -869,7 +870,8 @@ impl ExistTerm {
 
     fn local_variables(&self) -> HashSet<String> {
         match self {
-          ExistTerm::Variable(v) => HashSet::from([v.clone()]),
+          ExistTerm::AskerVariable(v) => HashSet::from([v.clone()]),
+          ExistTerm::TellerVariable(v) => HashSet::from([v.clone()]),
           ExistTerm::Compound(_, vec) => vec
                 .iter()
                 .flat_map(|arg| match arg {
@@ -885,8 +887,12 @@ impl ExistTerm {
     /** to と一致するような制約を返却。 */
     fn unification(&self, to: VariableRefOrAtom, env: &ExecuteEnvironment) -> ConstraintCheckResult {
         match self {
-            ExistTerm::Variable(v) =>{
+            ExistTerm::AskerVariable(v) =>{
               ConstraintCheckResult::SUCCEED(HashMap::from([(v.clone(), to.as_ref())]))
+            }
+            ExistTerm::TellerVariable(v) =>{
+              let Ok(tell_ref) = to.as_ref().get_tell_rights() else {return ConstraintCheckResult::CONTRADICTION};
+              ConstraintCheckResult::SUCCEED(HashMap::from([(v.clone(), tell_ref)]))
             }
             ExistTerm::Compound(self_name, self_args) => {
                 let Ok(Atom::Compound(to_name, to_args)) = 
@@ -1221,7 +1227,7 @@ mod tests {
                 Expressions {
                     exprs: vec![Expression::Compound(
                         "comp".to_string(),
-                        vec![ExpressionCompoundArg::Variable("Y".to_string())],
+                        vec![ExpressionCompoundArg::AskerVariable("Y".to_string())],
                     )],
                 },
             ),
@@ -1281,7 +1287,7 @@ mod tests {
                 Expressions {
                     exprs: vec![Expression::Compound(
                         "comp".to_string(),
-                        vec![ExpressionCompoundArg::Variable("K".to_string())],
+                        vec![ExpressionCompoundArg::AskerVariable("K".to_string())],
                     )],
                 },
             ),
@@ -1290,7 +1296,7 @@ mod tests {
                 Expressions {
                     exprs: vec![Expression::Compound(
                         "comp".to_string(),
-                        vec![ExpressionCompoundArg::Variable("K".to_string())],
+                        vec![ExpressionCompoundArg::AskerVariable("K".to_string())],
                     )],
                 },
             ),
@@ -1326,7 +1332,7 @@ mod tests {
                     vec![
                       ExistTermCompoundArg::Term(
                         ExistTerm::Compound("comp2".to_string(), vec![
-                          ExistTermCompoundArg::Term(ExistTerm::Variable("E".to_string())),                           
+                          ExistTermCompoundArg::Term(ExistTerm::AskerVariable("E".to_string())),                           
                           ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(2.into()))] })
                           ])
                       ),
@@ -1547,7 +1553,7 @@ mod tests {
     }
     #[test]
     fn compound_exists_test() {
-        let code = "?a(a2(E, 2), 3):=X->E=1->O=ok, X=a(a2(1, 2), 3).";
+        let code = "?X=a(a2(1, 2), !W), a(a2(E, 2), !T):=X->E=1->T=ok, W=ok->O=W.";
         match compile_one_behavior(&code) {
             Ok((ParseResult::Question(agent), remain)) => {
                 assert!(remain.is_empty());
