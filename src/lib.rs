@@ -3,6 +3,7 @@ pub mod parser;
 
 use expressions::expressions::Expressions;
 use num_rational::Rational64;
+use parser::parser::LexerExpressions;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -797,7 +798,7 @@ impl AskTerm for AskTermExists {
         let solved_result = self.expr.solve(constraints);
 
         match solved_result {
-            Ok(solved) => self.exis_term.unification(&solved, constraints),
+            Ok(solved) => self.exis_term.unification(VariableRefOrAtom::Atom(solved), constraints),
             Err(()) => ConstraintCheckResult::CONTRADICTION,
         }
     }
@@ -815,17 +816,43 @@ impl AskTerm for AskTermExists {
 }
 
 enum ExistTerm {
+    Variable(String),
     Compound(String, Vec<ExistTermCompoundArg>),
 }
 enum ExistTermCompoundArg {
     Expression(Expressions),
-    Variable(String),
     Term(ExistTerm)
+}
+
+enum VariableRefOrAtom {
+  VRef(VariableRef),
+  Atom(Atom)
+}
+
+impl VariableRefOrAtom {
+  fn get_atom(&self) -> Result<Atom, ()>{
+    match self {
+        VariableRefOrAtom::VRef(v_ref) => {
+          let Constraint::EqualTo(atom) = v_ref.wait_until_grounded()? else {return Err(())};
+          Ok(atom)
+        },
+        VariableRefOrAtom::Atom(atom) => Ok(atom.clone()),
+    }
+  }
+  fn as_ref(&self) -> VariableRef {
+    match self {
+      VariableRefOrAtom::VRef(v_ref) => {v_ref.clone()},
+      VariableRefOrAtom::Atom(atom) =>VariableRef { right: Arc::new(Mutex::new(VariableRight::Askable)), 
+        cons: Arc::new((Mutex::new(Constraint::EqualTo(atom.clone())), Condvar::new()))
+      },
+    }
+  }
 }
 
 impl ExistTerm {
     fn global_variables(&self) -> HashSet<String> {
         match self {
+            ExistTerm::Variable(_)=>{HashSet::new()},
             ExistTerm::Compound(_, vec) => vec
                 .iter()
                 .flat_map(|arg| match arg {
@@ -835,7 +862,6 @@ impl ExistTerm {
                     ExistTermCompoundArg::Term(term) =>{
                       term.global_variables()                      
                     }
-                    _=>HashSet::new()
                 })
                 .collect(),
         }
@@ -843,12 +869,10 @@ impl ExistTerm {
 
     fn local_variables(&self) -> HashSet<String> {
         match self {
-            ExistTerm::Compound(_, vec) => vec
+          ExistTerm::Variable(v) => HashSet::from([v.clone()]),
+          ExistTerm::Compound(_, vec) => vec
                 .iter()
                 .flat_map(|arg| match arg {
-                    ExistTermCompoundArg::Variable(v) => {
-                        HashSet::from([v.clone()])
-                    },
                     ExistTermCompoundArg::Term(term) => {
                       term.local_variables()
                     },
@@ -859,13 +883,16 @@ impl ExistTerm {
     }
 
     /** to と一致するような制約を返却。 */
-    fn unification(&self, to: &Atom, env: &ExecuteEnvironment) -> ConstraintCheckResult {
+    fn unification(&self, to: VariableRefOrAtom, env: &ExecuteEnvironment) -> ConstraintCheckResult {
         match self {
+            ExistTerm::Variable(v) =>{
+              ConstraintCheckResult::SUCCEED(HashMap::from([(v.clone(), to.as_ref())]))
+            }
             ExistTerm::Compound(self_name, self_args) => {
-                let Atom::Compound(to_name, to_args) = 
-                  to else{ return ConstraintCheckResult::CONTRADICTION;};
+                let Ok(Atom::Compound(to_name, to_args)) = 
+                  to.get_atom() else{ return ConstraintCheckResult::CONTRADICTION;};
 
-                if self_name != to_name || self_args.len() != to_args.len(){
+                if self_name != &to_name || self_args.len() != to_args.len(){
                   return ConstraintCheckResult::CONTRADICTION;
                 }
 
@@ -894,25 +921,12 @@ impl ExistTerm {
                         return ConstraintCheckResult::CONTRADICTION;                        
                       }
                     },
-                    ExistTermCompoundArg::Variable(variable) => {
-                      let to_ref  = match to_arg {
-                        CompoundArg::Atom(atom) => VariableRef{ right: Arc::new(Mutex::new(VariableRight::All)), cons: Arc::new((Mutex::new(Constraint::EqualTo( atom.clone())), Condvar::new())) },
-                        CompoundArg::Variable(variable) => variable.clone()                        
-                      };
-
-                      will_tell_args.insert(variable.clone(), to_ref);
-                    }
                     ExistTermCompoundArg::Term(term) => {
-                      let to_solved  = match to_arg {
-                        CompoundArg::Atom(atom) => atom.clone(),
-                        CompoundArg::Variable(variable) => {
-                         let Ok(Constraint::EqualTo(atom)) = variable.wait_until_grounded() else {
-                          return ConstraintCheckResult::CONTRADICTION;
-                         };
-                         atom
-                        }
+                      let pass_to_arg_unification  = match to_arg {
+                        CompoundArg::Atom(atom) => VariableRefOrAtom::Atom(atom.clone()),
+                        CompoundArg::Variable(variable) => VariableRefOrAtom::VRef(variable.clone())
                       };
-                      match term.unification(&to_solved, env) {
+                      match term.unification(pass_to_arg_unification, env) {
                         ConstraintCheckResult::SUCCEED(map) => will_tell_args.extend(map),
                         ConstraintCheckResult::CONTRADICTION => return ConstraintCheckResult::CONTRADICTION,
                       };
@@ -923,6 +937,13 @@ impl ExistTerm {
         }
     }
   }
+}
+
+fn create_ask_term_exists(
+  exis_term: ExistTerm,
+  expr: Expressions,
+) -> Box<dyn AskTerm> {
+  Box::new(AskTermExists { exis_term, expr })
 }
 
 #[cfg(test)]
@@ -1305,7 +1326,7 @@ mod tests {
                     vec![
                       ExistTermCompoundArg::Term(
                         ExistTerm::Compound("comp2".to_string(), vec![
-                          ExistTermCompoundArg::Variable("E".to_string()),                           
+                          ExistTermCompoundArg::Term(ExistTerm::Variable("E".to_string())),                           
                           ExistTermCompoundArg::Expression(Expressions { exprs: vec![Expression::Atom(Atom::Number(2.into()))] })
                           ])
                       ),
@@ -1512,6 +1533,38 @@ mod tests {
                             environment.key_store.get_constraint(&"O".into())
                         {
                             assert_eq!(s, "n");
+                        } else {
+                            assert!(false);
+                        };
+                    }
+                    Err(_) => assert!(false),
+                }
+            }
+            _ => {
+                assert!(false)
+            }
+        }
+    }
+    #[test]
+    fn compound_exists_test() {
+        let code = "?a(a2(E, 2), 3):=X->E=1->O=ok, X=a(a2(1, 2), 3).";
+        match compile_one_behavior(&code) {
+            Ok((ParseResult::Question(agent), remain)) => {
+                assert!(remain.is_empty());
+
+                let behavior = HashMap::new();
+                // 実行
+                let environment =
+                    ExecuteEnvironment::new(&behavior, agent.variables().into_iter());
+
+                let res = agent.solve(&environment);
+
+                match res {
+                    Ok(_) => {
+                        if let Ok(Constraint::EqualTo(Atom::Atom(s))) =
+                            environment.key_store.get_constraint(&"O".into())
+                        {
+                            assert_eq!(s, "ok");
                         } else {
                             assert!(false);
                         };

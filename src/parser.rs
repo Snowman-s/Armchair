@@ -88,7 +88,22 @@ pub mod parser {
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    pub struct LexerAskTerm {
+    pub enum LexerAskTerm {
+        Vec(LexerAskTermVec),
+        Exists(LexerAskTermExists),
+    }
+
+    impl LexerAskTerm {
+        fn compile(&self) -> Box<dyn AskTerm> {
+            match self {
+                LexerAskTerm::Vec(vec) => vec.compile(),
+                LexerAskTerm::Exists(exists) => exists.compile(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct LexerAskTermVec {
         first: LexerExpressions,
         remain: Vec<(LexerAskTermOp, LexerExpressions)>,
     }
@@ -113,7 +128,7 @@ pub mod parser {
         }
     }
 
-    impl LexerAskTerm {
+    impl LexerAskTermVec {
         fn compile(&self) -> Box<dyn AskTerm> {
             create_ask_term_vec(
                 self.first.compile(),
@@ -122,6 +137,51 @@ pub mod parser {
                     .map(|(a, b)| (a.compile(), b.compile()))
                     .collect(),
             )
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct LexerAskTermExists {
+        exis_term: LexerExisTerm,
+        expr: LexerExpressions,
+    }
+
+    impl LexerAskTermExists {
+        fn compile(&self) -> Box<dyn AskTerm> {
+            create_ask_term_exists(self.exis_term.compile(), self.expr.compile())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerExisTerm {
+        Variable(String),
+        Compound(String, Vec<LexerExistCompoundArg>),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum LexerExistCompoundArg {
+        Expression(LexerExpressions),
+        Term(Box<LexerExisTerm>),
+    }
+
+    impl LexerExisTerm {
+        fn compile(&self) -> ExistTerm {
+            match self {
+                LexerExisTerm::Variable(v) => ExistTerm::Variable(v.clone()),
+                LexerExisTerm::Compound(name, args) => ExistTerm::Compound(
+                    name.to_string(),
+                    args.iter()
+                        .map(|arg| match arg {
+                            LexerExistCompoundArg::Expression(expr) => {
+                                ExistTermCompoundArg::Expression(expr.compile())
+                            }
+                            LexerExistCompoundArg::Term(term) => {
+                                ExistTermCompoundArg::Term(term.compile())
+                            }
+                        })
+                        .collect(),
+                ),
+            }
         }
     }
 
@@ -237,12 +297,12 @@ pub mod parser {
     use num_rational::Rational64;
 
     use crate::{
-        create_ask_term_vec,
+        create_ask_term_exists, create_ask_term_vec,
         expressions::expressions::{
             Expression, ExpressionCompoundArg, Expressions, TwoNumberCalcType,
         },
         Agent, AskAgent, AskTerm, AskTermOp, Atom, Behavior, BehaviorParam, CallAgent,
-        CallArgument, LinearAgent, TellAgent,
+        CallArgument, ExistTerm, ExistTermCompoundArg, LinearAgent, TellAgent,
     };
 
     type Res<'a, T> = IResult<&'a str, T>;
@@ -451,30 +511,80 @@ pub mod parser {
     }
 
     fn parse_ask_term(code: &str) -> Res<LexerAskTerm> {
-        map(
-            tuple((
-                parse_expressions,
-                many1(tuple((
+        alt((
+            map(
+                tuple((
+                    parse_exist_term,
                     multispace0,
-                    alt((
-                        map(char('='), |_| LexerAskTermOp::AEqualB),
-                        map(tuple((char('<'), char('='))), |_| LexerAskTermOp::ALEB),
-                        map(tuple((char('>'), char('='))), |_| LexerAskTermOp::AGEB),
-                        map(char('<'), |_| LexerAskTermOp::ALTB),
-                        map(char('>'), |_| LexerAskTermOp::AGTB),
-                    )),
+                    char(':'),
+                    char('='),
                     multispace0,
                     parse_expressions,
-                ))),
-            )),
-            |(first, remain)| LexerAskTerm {
-                first: first,
-                remain: remain
-                    .into_iter()
-                    .map(|(_, op, _, expr): (_, LexerAskTermOp, _, LexerExpressions)| (op, expr))
-                    .collect(),
-            },
-        )(code)
+                )),
+                |(exis_term, _, _, _, _, expr)| {
+                    LexerAskTerm::Exists(LexerAskTermExists { exis_term, expr })
+                },
+            ),
+            map(
+                tuple((
+                    parse_expressions,
+                    many1(tuple((
+                        multispace0,
+                        alt((
+                            map(char('='), |_| LexerAskTermOp::AEqualB),
+                            map(tuple((char('<'), char('='))), |_| LexerAskTermOp::ALEB),
+                            map(tuple((char('>'), char('='))), |_| LexerAskTermOp::AGEB),
+                            map(char('<'), |_| LexerAskTermOp::ALTB),
+                            map(char('>'), |_| LexerAskTermOp::AGTB),
+                        )),
+                        multispace0,
+                        parse_expressions,
+                    ))),
+                )),
+                |(first, remain)| {
+                    LexerAskTerm::Vec(LexerAskTermVec {
+                        first: first,
+                        remain: remain
+                            .into_iter()
+                            .map(
+                                |(_, op, _, expr): (_, LexerAskTermOp, _, LexerExpressions)| {
+                                    (op, expr)
+                                },
+                            )
+                            .collect(),
+                    })
+                },
+            ),
+        ))(code)
+    }
+
+    fn parse_exist_term(code: &str) -> Res<LexerExisTerm> {
+        alt((
+            // コンパウンド
+            map(
+                tuple((
+                    parse_until_non_symbol,
+                    multispace0,
+                    char('('),
+                    multispace0,
+                    separated_list0(
+                        tuple((multispace0, char(','), multispace0)),
+                        alt((
+                            map(parse_exist_term, |term| {
+                                LexerExistCompoundArg::Term(Box::new(term))
+                            }),
+                            map(parse_expressions, |expr| {
+                                LexerExistCompoundArg::Expression(expr)
+                            }),
+                        )),
+                    ),
+                    char(')'),
+                )),
+                |(name, _, _, _, vec, _)| LexerExisTerm::Compound(name.to_string(), vec),
+            ),
+            // 変数
+            map(parse_variable, |v| LexerExisTerm::Variable(v.to_string())),
+        ))(code)
     }
 
     fn parse_linear_agent(code: &str) -> Res<LexerAgent> {
@@ -666,8 +776,9 @@ pub mod parser {
         use num_rational::Rational64;
 
         use crate::parser::parser::{
-            LexerAgent, LexerAskTerm, LexerAskTermOp, LexerBehavior, LexerCompoundArgument,
-            LexerExpressions, LexerTellAgent, LexerTwoNumberCalcType, ParseResult,
+            LexerAgent, LexerAskTerm, LexerAskTermOp, LexerAskTermVec, LexerBehavior,
+            LexerCompoundArgument, LexerExpressions, LexerTellAgent, LexerTwoNumberCalcType,
+            ParseResult,
         };
 
         use super::{parse_ask_agent, parse_behavior, parse_tell_agent};
@@ -711,7 +822,7 @@ pub mod parser {
                     if let LexerAgent::AskAgent(agent) = agent_enum {
                         assert_eq!(
                             agent.ask_term,
-                            LexerAskTerm {
+                            LexerAskTerm::Vec(LexerAskTermVec {
                                 first: LexerExpressions::TwoNumberCalc(
                                     Box::new(LexerExpressions::TwoNumberCalc(
                                         Box::new(LexerExpressions::AtomNumber(Rational64::new(
@@ -749,7 +860,7 @@ pub mod parser {
                                     LexerAskTermOp::AEqualB,
                                     LexerExpressions::AtomNumber(Rational64::new(20, 1))
                                 )]
-                            }
+                            })
                         );
                     } else {
                         assert!(false);
@@ -768,7 +879,7 @@ pub mod parser {
                     if let LexerAgent::AskAgent(agent) = agent_enum {
                         assert_eq!(
                             agent.ask_term,
-                            LexerAskTerm {
+                            LexerAskTerm::Vec(LexerAskTermVec {
                                 first: LexerExpressions::AtomNumber(10.into()),
                                 remain: vec![
                                     (
@@ -780,7 +891,7 @@ pub mod parser {
                                     (LexerAskTermOp::AGTB, LexerExpressions::Variable("A".into())),
                                     (LexerAskTermOp::ALTB, LexerExpressions::Variable("C".into())),
                                 ],
-                            }
+                            })
                         )
                     } else {
                         assert!(false)
