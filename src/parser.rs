@@ -626,7 +626,9 @@ pub mod parser {
     fn parse_until_non_symbol(code: &str) -> Res<&str> {
         recognize(take_while(|s: char| {
             ![
-                ',', '(', ')', '\'', ' ', '　', ':', '-', '>', '.', '=', '+', '-', '*', '/', '%',
+                ',', '(', ')', '\'', ' ', '　', ':', 
+                '-', '>', '.', '=', '+', '-', '*', 
+                '/', '%', '\n', '\r'
             ]
             .contains(&s)
         }))(code)
